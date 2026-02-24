@@ -31,6 +31,8 @@ pub enum Protocol {
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error>;
+    async fn get_server_directory(&self) -> Result<Vec<String>, Error>;
+    async fn get_logical_device_directory(&self, ld_name: String) -> Result<Vec<String>, Error>;
 }
 
 // Function constraint data (FCD) or function constraint data attribute (FCDA)
@@ -94,6 +96,15 @@ impl Client {
     pub async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error> {
         self.transport.get_data_values(refs).await
     }
+    pub async fn get_server_directory(&self) -> Result<Vec<String>, Error> {
+        self.transport.get_server_directory().await
+    }
+    pub async fn get_logical_device_directory(
+        &self,
+        ld_name: String,
+    ) -> Result<Vec<String>, Error> {
+        self.transport.get_logical_device_directory(ld_name).await
+    }
 }
 
 #[cfg(test)]
@@ -104,14 +115,30 @@ mod tests {
 
     #[derive(Default)]
     struct MockTransport {
-        calls: Mutex<Vec<usize>>,
+        calls: Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl Transport for Arc<MockTransport> {
         async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error> {
-            self.calls.lock().unwrap().push(refs.len());
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("data:{}", refs.len()));
             Ok(vec![IECData::Boolean(true); refs.len()])
+        }
+
+        async fn get_server_directory(&self) -> Result<Vec<String>, Error> {
+            self.calls.lock().unwrap().push("server_dir".to_string());
+            Ok(vec!["IED1".to_string(), "IED2".to_string()])
+        }
+
+        async fn get_logical_device_directory(
+            &self,
+            ld_name: String,
+        ) -> Result<Vec<String>, Error> {
+            self.calls.lock().unwrap().push(format!("ld:{}", ld_name));
+            Ok(vec!["IED1".to_string(), "IED2".to_string()])
         }
     }
 
@@ -134,6 +161,40 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls.as_slice(), &[1]);
+        assert_eq!(calls.as_slice(), &["data:1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn client_forwards_server_directory_call() {
+        let transport = Arc::new(MockTransport::default());
+        let client = Client {
+            transport: Box::new(transport.clone()),
+        };
+
+        let dirs = client
+            .get_server_directory()
+            .await
+            .expect("client should return server directory");
+
+        assert_eq!(dirs, vec!["IED1".to_string(), "IED2".to_string()]);
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &["server_dir".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn client_forwards_logical_device_directory_call() {
+        let transport = Arc::new(MockTransport::default());
+        let client = Client {
+            transport: Box::new(transport.clone()),
+        };
+
+        let lds = client
+            .get_logical_device_directory("LD0".to_string())
+            .await
+            .expect("client should return logical device directory");
+
+        assert_eq!(lds, vec!["IED1".to_string(), "IED2".to_string()]);
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &["ld:LD0".to_string()]);
     }
 }

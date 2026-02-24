@@ -10,8 +10,8 @@ use mms::{
     AlternateAccess, AlternateAccessSelection, AlternateAccessSelectionSelectAccess,
     AlternateAccessSelectionSelectAlternateAccess,
     AlternateAccessSelectionSelectAlternateAccessAccessSelection, AnonymousAlternateAccess,
-    AnonymousVariableAccessSpecificationListOfVariable, Identifier, ObjectName,
-    ObjectNameDomainSpecific, Unsigned32, VariableAccessSpecification,
+    AnonymousVariableAccessSpecificationListOfVariable, GetNameListRequestObjectScope, Identifier,
+    ObjectClass, ObjectName, ObjectNameDomainSpecific, Unsigned32, VariableAccessSpecification,
     VariableAccessSpecificationListOfVariable, VariableSpecification, VisibleString,
 };
 use std::time::Duration;
@@ -498,6 +498,37 @@ impl Transport for MmsTransport {
         }
 
         Ok(values)
+    }
+
+    async fn get_server_directory(&self) -> Result<Vec<String>, crate::client::Error> {
+        let object_class = ObjectClass::basicObjectClass(9);
+        let object_scope = GetNameListRequestObjectScope::vmdSpecific(());
+
+        let results = self
+            .client
+            .get_name_list(object_class, object_scope)
+            .await
+            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+
+        Ok(results.iter().map(|s| s.0.to_string()).collect())
+    }
+
+    async fn get_logical_device_directory(
+        &self,
+        ld_name: String,
+    ) -> Result<Vec<String>, crate::client::Error> {
+        let object_class = ObjectClass::basicObjectClass(0);
+        let object_scope = GetNameListRequestObjectScope::domainSpecific(Identifier(
+            VisibleString::try_from(ld_name).unwrap_or_default(),
+        ));
+
+        let results = self
+            .client
+            .get_name_list(object_class, object_scope)
+            .await
+            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+
+        Ok(results.iter().map(|s| s.0.to_string()).collect())
     }
 }
 
