@@ -1,7 +1,7 @@
 use crate::client::{DataReference, Error, Transport};
-use crate::types::{IECData, TimeQuality, Timestamp};
+use crate::types::{DataDefinition, DataType, IECData, TimeQuality, Timestamp};
 use async_trait::async_trait;
-use mms::messages::iso_9506_mms_1::UtcTime;
+use mms::messages::iso_9506_mms_1::{TypeSpecification, UtcTime};
 use mms::{
     client::{Client as MmsClient, TLSConfig},
     AccessResult, Data, TimeOfDay,
@@ -10,9 +10,11 @@ use mms::{
     AlternateAccess, AlternateAccessSelection, AlternateAccessSelectionSelectAccess,
     AlternateAccessSelectionSelectAlternateAccess,
     AlternateAccessSelectionSelectAlternateAccessAccessSelection, AnonymousAlternateAccess,
-    AnonymousVariableAccessSpecificationListOfVariable, GetNameListRequestObjectScope, Identifier,
-    ObjectClass, ObjectName, ObjectNameDomainSpecific, Unsigned32, VariableAccessSpecification,
-    VariableAccessSpecificationListOfVariable, VariableSpecification, VisibleString,
+    AnonymousVariableAccessSpecificationListOfVariable, GetNameListRequestObjectScope,
+    GetVariableAccessAttributesRequest, Identifier, ObjectClass, ObjectName,
+    ObjectNameDomainSpecific, TypeDescription, TypeDescriptionStructure, Unsigned32,
+    VariableAccessSpecification, VariableAccessSpecificationListOfVariable, VariableSpecification,
+    VisibleString,
 };
 use std::time::Duration;
 
@@ -77,6 +79,78 @@ pub fn mms_data_to_iec(data: &Data) -> IECData {
         Data::utc_time(uct_time) => IECData::Timestamp(utc_time_to_timestamp(uct_time)),
         _ => IECData::VisibleString("Unsupported MMS data type".to_string()),
     }
+}
+
+/// Converts a named MMS type description into a [`DataDefinition`].
+///
+/// This is the primary entry point when processing a GetDataDefinition
+/// service response: `name` is the element name from the response and
+/// `type_description` carries the structural type information.
+pub fn type_description_to_data_definition(
+    name: String,
+    type_description: &TypeDescription,
+) -> DataDefinition {
+    DataDefinition {
+        name,
+        data_type: type_description_to_data_type(type_description),
+    }
+}
+
+/// Recursively maps a [`TypeDescription`] to the equivalent [`DataType`].
+fn type_description_to_data_type(type_description: &TypeDescription) -> DataType {
+    match type_description {
+        TypeDescription::structure(struct_desc) => {
+            DataType::Structure(get_structure_children(struct_desc))
+        }
+        TypeDescription::array(arr_desc) => {
+            let count = arr_desc.number_of_elements.0;
+            let element_type = match &arr_desc.element_type {
+                TypeSpecification::typeDescription(td) => type_description_to_data_type(td),
+                // Named type reference: not resolvable without a type dictionary;
+                // treat as opaque visible string for now.
+                _ => DataType::VisibleString,
+            };
+            DataType::Array {
+                count,
+                element_type: Box::new(element_type),
+            }
+        }
+        TypeDescription::boolean(_) => DataType::Boolean,
+        TypeDescription::bit_string(_) => DataType::BitString,
+        TypeDescription::integer(_) => DataType::Int,
+        TypeDescription::unsigned(_) => DataType::UInt,
+        TypeDescription::floating_point(_) => DataType::Float,
+        TypeDescription::octet_string(_) => DataType::OctetString,
+        TypeDescription::visible_string(_) => DataType::VisibleString,
+        TypeDescription::mMSString(_) => DataType::MmsString,
+        // All time variants resolve to the unified Timestamp type
+        TypeDescription::utc_time(_)
+        | TypeDescription::generalized_time(_)
+        | TypeDescription::binary_time(_) => DataType::Timestamp,
+        // bcd and objId have no direct IEC 61850 equivalent; treat as opaque
+        _ => DataType::VisibleString,
+    }
+}
+
+/// Expands the components of an MMS structure type into a [`Vec<DataDefinition>`].
+fn get_structure_children(struct_desc: &TypeDescriptionStructure) -> Vec<DataDefinition> {
+    struct_desc
+        .components
+        .0
+        .iter()
+        .map(|component| {
+            let name = component
+                .component_name
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default();
+            let data_type = match &component.component_type {
+                TypeSpecification::typeDescription(td) => type_description_to_data_type(td),
+                _ => DataType::VisibleString,
+            };
+            DataDefinition { name, data_type }
+        })
+        .collect()
 }
 
 /// Converts MMS GeneralizedTime to IEC 61850 Timestamp
@@ -241,26 +315,14 @@ fn parse_references(
     let mut variables = Vec::with_capacity(data_references.len());
 
     for data_reference in data_references {
-        let parts: Vec<&str> = data_reference.reference.split('/').collect();
-        if parts.len() != 2 {
-            return Err(Error::ParseError(format!(
-                "Invalid reference format. Expected 'Domain/Path[FC]', found: {}",
-                data_reference.reference
-            )));
-        }
-
-        let domain_id = parts[0];
-        let ln_reference = parts[1];
-
         let fc = &data_reference.fc;
-        let logical_node_path: Vec<&str> = ln_reference.split('.').collect();
-        let data_object_path = &logical_node_path[1..];
+        let (domain_id, data_path) = parse_paths(data_reference)?;
+        let data_object_path = &data_path[1..];
 
         let domain_object = ObjectNameDomainSpecific {
             domain_id: Identifier(VisibleString::try_from(domain_id).unwrap_or_default()),
             item_id: Identifier(
-                VisibleString::try_from(build_item_id(fc, logical_node_path.clone()))
-                    .unwrap_or_default(),
+                VisibleString::try_from(build_item_id(fc, data_path.clone())).unwrap_or_default(),
             ),
         };
         let object_name = ObjectName::domain_specific(domain_object);
@@ -279,6 +341,21 @@ fn parse_references(
     Ok(VariableAccessSpecification::listOfVariable(
         list_of_variable,
     ))
+}
+
+fn parse_paths(data_reference: &DataReference) -> Result<(String, Vec<&str>), Error> {
+    let parts: Vec<&str> = data_reference.reference.split('/').collect();
+    if parts.len() != 2 {
+        return Err(Error::ParseError(format!(
+            "Invalid reference format. Expected 'Domain/Path[FC]', found: {}",
+            data_reference.reference
+        )));
+    }
+
+    let domain_id = parts[0].to_string();
+    let data_path = parts[1].split('.').map(|s| s).collect::<Vec<&str>>();
+
+    Ok((domain_id, data_path))
 }
 
 // return itemId for a given reference, e.g., "IED1/LLN0$ST$Val" -> "LLN0$ST$Val"
@@ -529,6 +606,43 @@ impl Transport for MmsTransport {
             .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
 
         Ok(results.iter().map(|s| s.0.to_string()).collect())
+    }
+
+    async fn get_data_definition(
+        &self,
+        data_ref: DataReference,
+    ) -> Result<DataDefinition, crate::client::Error> {
+        let fc = &data_ref.fc;
+        // Extract the leaf name from the reference, e.g. "IED1/XCBR1.Pos" -> "Pos"
+        let name = data_ref
+            .reference
+            .rsplit(['/', '.'])
+            .next()
+            .unwrap_or(&data_ref.reference)
+            .to_string();
+
+        let (domain_id, data_path) = parse_paths(&data_ref)?;
+
+        let domain_object = ObjectNameDomainSpecific {
+            domain_id: Identifier(VisibleString::try_from(domain_id).unwrap_or_default()),
+            item_id: Identifier(
+                VisibleString::try_from(build_item_id(fc, data_path.clone())).unwrap_or_default(),
+            ),
+        };
+        let object_name = ObjectName::domain_specific(domain_object);
+
+        let request = GetVariableAccessAttributesRequest::name(object_name);
+
+        let result = self
+            .client
+            .get_variable_access_attributes(request)
+            .await
+            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+
+        Ok(type_description_to_data_definition(
+            name,
+            &result.type_description,
+        ))
     }
 }
 

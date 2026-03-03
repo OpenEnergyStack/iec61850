@@ -1,4 +1,7 @@
-use crate::{mms::MmsTransport, types::IECData};
+use crate::{
+    mms::MmsTransport,
+    types::{DataDefinition, IECData},
+};
 
 use async_trait::async_trait;
 use mms::client::TLSConfig;
@@ -33,6 +36,7 @@ pub trait Transport: Send + Sync {
     async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error>;
     async fn get_server_directory(&self) -> Result<Vec<String>, Error>;
     async fn get_logical_device_directory(&self, ld_name: String) -> Result<Vec<String>, Error>;
+    async fn get_data_definition(&self, data_ref: DataReference) -> Result<DataDefinition, Error>;
 }
 
 // Function constraint data (FCD) or function constraint data attribute (FCDA)
@@ -105,6 +109,12 @@ impl Client {
     ) -> Result<Vec<String>, Error> {
         self.transport.get_logical_device_directory(ld_name).await
     }
+    pub async fn get_data_definition(
+        &self,
+        data_ref: DataReference,
+    ) -> Result<DataDefinition, Error> {
+        self.transport.get_data_definition(data_ref).await
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +149,17 @@ mod tests {
         ) -> Result<Vec<String>, Error> {
             self.calls.lock().unwrap().push(format!("ld:{}", ld_name));
             Ok(vec!["IED1".to_string(), "IED2".to_string()])
+        }
+
+        async fn get_data_definition(
+            &self,
+            data_ref: DataReference,
+        ) -> Result<DataDefinition, Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("def:{}", data_ref.reference));
+            todo!("Return proper DataDefinition")
         }
     }
 
