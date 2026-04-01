@@ -596,6 +596,46 @@ impl ReportOptFields {
     }
 }
 
+/// Optional fields for an Unbuffered Report Control Block (URCB).
+///
+/// Same bit layout as [`ReportOptFields`] but `buffer_overflow` (bit 6) and
+/// `entry_id` (bit 7) are not applicable to unbuffered reports and are always
+/// encoded as `0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UnbufferedReportOptFields {
+    /// Sequence number — bit 1
+    pub sequence_number: bool,
+    /// Report timestamp — bit 2
+    pub report_time_stamp: bool,
+    /// Reason for inclusion — bit 3
+    pub reason_for_inclusion: bool,
+    /// Data-set name — bit 4
+    pub data_set_name: bool,
+    /// Data reference — bit 5
+    pub data_reference: bool,
+    /// Configuration revision — bit 8
+    pub conf_revision: bool,
+    /// Segmentation — bit 9
+    pub segmentation: bool,
+}
+
+impl UnbufferedReportOptFields {
+    /// Encodes as a 10-character binary string.
+    /// Bit 0 (reserved), bit 6 (buffer_overflow) and bit 7 (entry_id) are always `0`.
+    pub fn to_bit_string(&self) -> String {
+        format!(
+            "0{}{}{}{}{}00{}{}",
+            if self.sequence_number { '1' } else { '0' },
+            if self.report_time_stamp { '1' } else { '0' },
+            if self.reason_for_inclusion { '1' } else { '0' },
+            if self.data_set_name { '1' } else { '0' },
+            if self.data_reference { '1' } else { '0' },
+            if self.conf_revision { '1' } else { '0' },
+            if self.segmentation { '1' } else { '0' },
+        )
+    }
+}
+
 /// Settings for a Buffered Report Control Block (BRCB) write operation
 /// All fields are optional — set only the attributes you want to write.
 /// Read-only attributes (`SqNum`, `TimeOfEntry`, `ConfRev`, `Owner`) are excluded.
@@ -623,6 +663,32 @@ pub struct SetBrcbValuesSettings {
     pub entry_id: Option<Vec<u8>>,
     /// Reservation time in seconds (ResvTms, BRCB only)
     pub resv_tms: Option<i16>,
+}
+
+/// Settings for an Unbuffered Report Control Block (URCB) write operation.
+/// All fields are optional — set only the attributes you want to write.
+/// Read-only attributes (`SqNum`, `ConfRev`, `Owner`) are excluded.
+/// URCB has no `PurgeBuf`, no `EntryID`, and no `ResvTms`; instead it has `Resv` (boolean reservation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SetUrcbValuesSettings {
+    /// Report identifier (RptID)
+    pub rpt_id: Option<String>,
+    /// Report enable (RptEna)
+    pub rpt_ena: Option<bool>,
+    /// Reservation flag (Resv) — reserve the URCB for exclusive use by this client
+    pub resv: Option<bool>,
+    /// Dataset reference (DatSet)
+    pub dat_set: Option<String>,
+    /// Optional fields to include in each entry (OptFlds)
+    pub opt_flds: Option<UnbufferedReportOptFields>,
+    /// Buffer time in milliseconds (BufTm)
+    pub buf_tm: Option<u32>,
+    /// Trigger options (TrgOps)
+    pub trg_ops: Option<TriggerOptions>,
+    /// Integrity period in milliseconds (IntgPd)
+    pub intg_pd: Option<u32>,
+    /// General interrogation trigger (GI) — write `true` to trigger
+    pub gi: Option<bool>,
 }
 
 /// Schema node produced by the MMS GetDataDefinition service.

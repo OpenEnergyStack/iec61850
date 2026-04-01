@@ -1,6 +1,7 @@
 use crate::client::{DataReference, Error, Transport};
 use crate::types::{
-    DataDefinition, DataType, IECData, SetBrcbValuesSettings, TimeQuality, Timestamp,
+    DataDefinition, DataType, IECData, SetBrcbValuesSettings, SetUrcbValuesSettings, TimeQuality,
+    Timestamp,
 };
 use async_trait::async_trait;
 use mms::messages::iso_9506_mms_1::{AnonymousWriteResponse, TypeSpecification, UtcTime};
@@ -822,6 +823,83 @@ impl Transport for MmsTransport {
             .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
 
         println!("set_brcb_values result: {:#?}", write_results);
+
+        let results: Vec<Result<(), crate::client::Error>> = write_results
+            .into_iter()
+            .map(|r| match r {
+                AnonymousWriteResponse::success(()) => Ok(()),
+                AnonymousWriteResponse::failure(e) => {
+                    Err(crate::client::Error::DataAccessError(e.0))
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    async fn set_urcb_values(
+        &self,
+        urcb_ref: String,
+        settings: SetUrcbValuesSettings,
+    ) -> Result<Vec<Result<(), crate::client::Error>>, crate::client::Error> {
+        let mut refs: Vec<DataReference> = Vec::new();
+        let mut values: Vec<IECData> = Vec::new();
+
+        macro_rules! push {
+            ($attr:expr, $value:expr) => {
+                refs.push(DataReference {
+                    reference: format!("{}.{}", urcb_ref, $attr),
+                    fc: "RP".to_string(),
+                });
+                values.push($value);
+            };
+        }
+
+        if let Some(v) = settings.rpt_id {
+            push!("RptID", IECData::VisibleString(v));
+        }
+        if let Some(v) = settings.dat_set {
+            push!("DatSet", IECData::VisibleString(v));
+        }
+        if let Some(v) = settings.opt_flds {
+            push!("OptFlds", IECData::BitString(v.to_bit_string()));
+        }
+        if let Some(v) = settings.buf_tm {
+            push!("BufTm", IECData::UInt(v as u64));
+        }
+        if let Some(v) = settings.trg_ops {
+            push!("TrgOps", IECData::BitString(v.to_bit_string()));
+        }
+        if let Some(v) = settings.intg_pd {
+            push!("IntgPd", IECData::UInt(v as u64));
+        }
+        if let Some(v) = settings.gi {
+            push!("GI", IECData::Boolean(v));
+        }
+        if let Some(v) = settings.resv {
+            push!("Resv", IECData::Boolean(v));
+        }
+        // RptEna is always written last so all other settings are applied first.
+        if let Some(v) = settings.rpt_ena {
+            push!("RptEna", IECData::Boolean(v));
+        }
+
+        if refs.is_empty() {
+            return Err(crate::client::Error::ParseError(
+                "No URCB settings provided".into(),
+            ));
+        }
+
+        let variable: VariableAccessSpecification = parse_references(&refs)?;
+        let data: Result<Vec<Data>, crate::client::Error> =
+            values.iter().map(iec_data_to_mms).collect();
+        let data = data?;
+
+        let write_results = self
+            .client
+            .write(variable, data)
+            .await
+            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
 
         let results: Vec<Result<(), crate::client::Error>> = write_results
             .into_iter()

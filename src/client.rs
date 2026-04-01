@@ -1,6 +1,6 @@
 use crate::{
     mms::MmsTransport,
-    types::{DataDefinition, IECData, SetBrcbValuesSettings},
+    types::{DataDefinition, IECData, SetBrcbValuesSettings, SetUrcbValuesSettings},
 };
 
 use async_trait::async_trait;
@@ -41,6 +41,11 @@ pub trait Transport: Send + Sync {
         &self,
         brcb_ref: String,
         settings: SetBrcbValuesSettings,
+    ) -> Result<Vec<Result<(), Error>>, Error>;
+    async fn set_urcb_values(
+        &self,
+        urcb_ref: String,
+        settings: SetUrcbValuesSettings,
     ) -> Result<Vec<Result<(), Error>>, Error>;
 }
 
@@ -134,6 +139,14 @@ impl Client {
     ) -> Result<Vec<Result<(), Error>>, Error> {
         self.transport.set_brcb_values(brcb_ref, settings).await
     }
+
+    pub async fn set_urcb_values(
+        &self,
+        urcb_ref: String,
+        settings: SetUrcbValuesSettings,
+    ) -> Result<Vec<Result<(), Error>>, Error> {
+        self.transport.set_urcb_values(urcb_ref, settings).await
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +203,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("brcb:{}", brcb_ref));
+            Ok(vec![])
+        }
+
+        async fn set_urcb_values(
+            &self,
+            urcb_ref: String,
+            _settings: SetUrcbValuesSettings,
+        ) -> Result<Vec<Result<(), Error>>, Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("urcb:{}", urcb_ref));
             Ok(vec![])
         }
     }
