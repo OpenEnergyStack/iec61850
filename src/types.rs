@@ -649,6 +649,22 @@ pub struct UnbufferedReportOptFields {
 }
 
 impl UnbufferedReportOptFields {
+    /// Decodes from a binary string. Bits 0 (reserved), 6 (buffer_overflow), 7 (entry_id) are ignored.
+    pub fn from_bit_string(bits: &str) -> Self {
+        let b: Vec<char> = bits.chars().collect();
+        let bit = |i: usize| b.get(i).is_some_and(|&c| c == '1');
+        UnbufferedReportOptFields {
+            sequence_number: bit(1),
+            report_time_stamp: bit(2),
+            reason_for_inclusion: bit(3),
+            data_set_name: bit(4),
+            data_reference: bit(5),
+            // bit 6 (buffer_overflow) and bit 7 (entry_id) not applicable to URCB
+            conf_revision: bit(8),
+            segmentation: bit(9),
+        }
+    }
+
     /// Encodes as a 10-character binary string.
     /// Bit 0 (reserved), bit 6 (buffer_overflow) and bit 7 (entry_id) are always `0`.
     pub fn to_bit_string(&self) -> String {
@@ -780,6 +796,37 @@ pub struct SetUrcbValuesSettings {
     pub intg_pd: Option<u32>,
     /// General interrogation trigger (GI) — write `true` to trigger
     pub gi: Option<bool>,
+}
+
+/// Full set of attributes returned by reading an Unbuffered Report Control Block (URCB).
+/// Includes both settable and read-only attributes.
+/// URCB has no `PurgeBuf`, `EntryID`, `TimeOfEntry`, or `ResvTms`; instead it has `Resv`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnbufferedReportControlBlock {
+    /// Report identifier (RptID)
+    pub rpt_id: String,
+    /// Report enable (RptEna)
+    pub rpt_ena: bool,
+    /// Reservation flag (Resv) — exclusive use by this client
+    pub resv: bool,
+    /// Dataset reference (DatSet)
+    pub dat_set: String,
+    /// Configuration revision (ConfRev) — read-only
+    pub conf_rev: u32,
+    /// Optional fields (OptFlds)
+    pub opt_flds: UnbufferedReportOptFields,
+    /// Buffer time in milliseconds (BufTm)
+    pub buf_tm: u32,
+    /// Sequence number (SqNum) — read-only
+    pub sq_num: u32,
+    /// Trigger options (TrgOps)
+    pub trg_ops: TriggerOptions,
+    /// Integrity period in milliseconds (IntgPd)
+    pub intg_pd: u32,
+    /// General interrogation (GI)
+    pub gi: bool,
+    /// Owner (Owner), raw bytes — read-only; absent on some servers
+    pub owner: Option<Vec<u8>>,
 }
 
 /// Schema node produced by the MMS GetDataDefinition service.

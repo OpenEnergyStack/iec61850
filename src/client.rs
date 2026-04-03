@@ -2,7 +2,7 @@ use crate::{
     mms::MmsTransport,
     types::{
         BufferedReportControlBlock, DataDefinition, IECData, SetBrcbValuesSettings,
-        SetUrcbValuesSettings,
+        SetUrcbValuesSettings, UnbufferedReportControlBlock,
     },
 };
 
@@ -51,6 +51,10 @@ pub trait Transport: Send + Sync {
         settings: SetUrcbValuesSettings,
     ) -> Result<Vec<Result<(), Error>>, Error>;
     async fn get_brcb_values(&self, brcb_ref: String) -> Result<BufferedReportControlBlock, Error>;
+    async fn get_urcb_values(
+        &self,
+        urcb_ref: String,
+    ) -> Result<UnbufferedReportControlBlock, Error>;
 }
 
 // Function constraint data (FCD) or function constraint data attribute (FCDA)
@@ -158,6 +162,13 @@ impl Client {
     ) -> Result<BufferedReportControlBlock, Error> {
         self.transport.get_brcb_values(brcb_ref).await
     }
+
+    pub async fn get_urcb_values(
+        &self,
+        urcb_ref: String,
+    ) -> Result<UnbufferedReportControlBlock, Error> {
+        self.transport.get_urcb_values(urcb_ref).await
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +249,17 @@ mod tests {
                 .unwrap()
                 .push(format!("get_brcb:{}", brcb_ref));
             todo!("Return proper BufferedReportControlBlock")
+        }
+
+        async fn get_urcb_values(
+            &self,
+            urcb_ref: String,
+        ) -> Result<UnbufferedReportControlBlock, Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("get_urcb:{}", urcb_ref));
+            todo!("Return proper UnbufferedReportControlBlock")
         }
     }
 

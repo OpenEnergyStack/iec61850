@@ -2,6 +2,7 @@ use crate::client::{DataReference, Error, Transport};
 use crate::types::{
     BufferedReportControlBlock, DataDefinition, DataType, EntryTime, IECData, ReportOptFields,
     SetBrcbValuesSettings, SetUrcbValuesSettings, TimeQuality, Timestamp, TriggerOptions,
+    UnbufferedReportControlBlock, UnbufferedReportOptFields,
 };
 use async_trait::async_trait;
 use mms::messages::iso_9506_mms_1::{AnonymousWriteResponse, TypeSpecification, UtcTime};
@@ -1061,6 +1062,149 @@ impl Transport for MmsTransport {
             resv_tms: as_i16(&fields[13], "ResvTms")?,
             owner: if fields.len() > 14 {
                 Some(as_bytes(&fields[14], "Owner")?)
+            } else {
+                None
+            },
+        })
+    }
+
+    async fn get_urcb_values(
+        &self,
+        urcb_ref: String,
+    ) -> Result<UnbufferedReportControlBlock, crate::client::Error> {
+        let refs = vec![DataReference {
+            reference: urcb_ref,
+            fc: "RP".to_string(),
+        }];
+        let variable: VariableAccessSpecification = parse_references(&refs)?;
+
+        let results = self
+            .client
+            .read(variable)
+            .await
+            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+
+        let fields = match results.into_iter().next() {
+            Some(AccessResult::success(data)) => match data {
+                Data::structure(s) => s,
+                _ => {
+                    return Err(crate::client::Error::ParseError(
+                        "Expected structure response for URCB".into(),
+                    ))
+                }
+            },
+            Some(AccessResult::failure(e)) => {
+                return Err(crate::client::Error::DataAccessError(e.0))
+            }
+            None => {
+                return Err(crate::client::Error::ParseError(
+                    "Empty response for URCB read".into(),
+                ))
+            }
+        };
+
+        // URCB has 11 mandatory fields + optional Owner = 11 or 12
+        if fields.len() < 11 {
+            for (i, f) in fields.iter().enumerate() {
+                println!("  [{i}]: {f:#?}");
+            }
+            return Err(crate::client::Error::ParseError(format!(
+                "Expected 11 or 12 structure fields for URCB, got {}",
+                fields.len()
+            )));
+        }
+
+        fn as_string(data: &Data, name: &'static str) -> Result<String, crate::client::Error> {
+            match data {
+                Data::visible_string(s) => Ok(s.to_string()),
+                Data::mMSString(s) => Ok(s.0.to_string()),
+                _ => Err(crate::client::Error::ParseError(format!(
+                    "{name}: expected string"
+                ))),
+            }
+        }
+        fn as_bool(data: &Data, name: &'static str) -> Result<bool, crate::client::Error> {
+            match data {
+                Data::boolean(b) => Ok(*b),
+                _ => Err(crate::client::Error::ParseError(format!(
+                    "{name}: expected bool"
+                ))),
+            }
+        }
+        fn as_u32(data: &Data, name: &'static str) -> Result<u32, crate::client::Error> {
+            match data {
+                Data::unsigned(u) => Ok(u64::try_from(u).unwrap_or(0) as u32),
+                Data::integer(i) => Ok(i64::try_from(i).unwrap_or(0) as u32),
+                _ => Err(crate::client::Error::ParseError(format!(
+                    "{name}: expected uint"
+                ))),
+            }
+        }
+        fn as_bytes(data: &Data, name: &'static str) -> Result<Vec<u8>, crate::client::Error> {
+            match data {
+                Data::octet_string(octets) => Ok(octets.as_ref().to_vec()),
+                _ => Err(crate::client::Error::ParseError(format!(
+                    "{name}: expected octet string"
+                ))),
+            }
+        }
+        fn as_urcb_opt_flds(
+            data: &Data,
+        ) -> Result<UnbufferedReportOptFields, crate::client::Error> {
+            match data {
+                Data::bit_string(bits) => {
+                    let s: String = bits
+                        .as_raw_slice()
+                        .iter()
+                        .flat_map(|b| {
+                            (0..8)
+                                .rev()
+                                .map(move |i| if b & (1 << i) != 0 { '1' } else { '0' })
+                        })
+                        .collect();
+                    Ok(UnbufferedReportOptFields::from_bit_string(&s))
+                }
+                _ => Err(crate::client::Error::ParseError(
+                    "OptFlds: expected bit string".into(),
+                )),
+            }
+        }
+        fn as_trg_ops(data: &Data) -> Result<TriggerOptions, crate::client::Error> {
+            match data {
+                Data::bit_string(bits) => {
+                    let s: String = bits
+                        .as_raw_slice()
+                        .iter()
+                        .flat_map(|b| {
+                            (0..8)
+                                .rev()
+                                .map(move |i| if b & (1 << i) != 0 { '1' } else { '0' })
+                        })
+                        .collect();
+                    Ok(TriggerOptions::from_bit_string(&s))
+                }
+                _ => Err(crate::client::Error::ParseError(
+                    "TrgOps: expected bit string".into(),
+                )),
+            }
+        }
+
+        // URCB field order: RptID, RptEna, Resv, DatSet, ConfRev, OptFlds,
+        //                   BufTm, SqNum, TrgOps, IntgPd, GI, [Owner]
+        Ok(UnbufferedReportControlBlock {
+            rpt_id: as_string(&fields[0], "RptID")?,
+            rpt_ena: as_bool(&fields[1], "RptEna")?,
+            resv: as_bool(&fields[2], "Resv")?,
+            dat_set: as_string(&fields[3], "DatSet")?,
+            conf_rev: as_u32(&fields[4], "ConfRev")?,
+            opt_flds: as_urcb_opt_flds(&fields[5])?,
+            buf_tm: as_u32(&fields[6], "BufTm")?,
+            sq_num: as_u32(&fields[7], "SqNum")?,
+            trg_ops: as_trg_ops(&fields[8])?,
+            intg_pd: as_u32(&fields[9], "IntgPd")?,
+            gi: as_bool(&fields[10], "GI")?,
+            owner: if fields.len() > 11 {
+                Some(as_bytes(&fields[11], "Owner")?)
             } else {
                 None
             },
