@@ -1,10 +1,11 @@
 use crate::{
     mms::MmsTransport,
     types::{
-        BufferedReportControlBlock, DataDefinition, IECData, SetBrcbValuesSettings,
-        SetUrcbValuesSettings, UnbufferedReportControlBlock,
+        BufferedReportControlBlock, DataDefinition, IECData, Report, ReportType,
+        SetBrcbValuesSettings, SetUrcbValuesSettings, UnbufferedReportControlBlock,
     },
 };
+use tokio::sync::mpsc;
 
 use async_trait::async_trait;
 use mms::client::TLSConfig;
@@ -55,6 +56,12 @@ pub trait Transport: Send + Sync {
         &self,
         urcb_ref: String,
     ) -> Result<UnbufferedReportControlBlock, Error>;
+    fn subscribe_reports(
+        &self,
+        control_block_ref: String,
+        rpt_id: String,
+        report_type: ReportType,
+    ) -> mpsc::Receiver<Report>;
 }
 
 // Function constraint data (FCD) or function constraint data attribute (FCDA)
@@ -169,6 +176,16 @@ impl Client {
     ) -> Result<UnbufferedReportControlBlock, Error> {
         self.transport.get_urcb_values(urcb_ref).await
     }
+
+    pub fn subscribe_reports(
+        &self,
+        control_block_ref: String,
+        rpt_id: String,
+        report_type: ReportType,
+    ) -> mpsc::Receiver<Report> {
+        self.transport
+            .subscribe_reports(control_block_ref, rpt_id, report_type)
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +277,16 @@ mod tests {
                 .unwrap()
                 .push(format!("get_urcb:{}", urcb_ref));
             todo!("Return proper UnbufferedReportControlBlock")
+        }
+
+        fn subscribe_reports(
+            &self,
+            _control_block_ref: String,
+            _rpt_id: String,
+            _report_type: ReportType,
+        ) -> mpsc::Receiver<Report> {
+            let (_tx, rx) = mpsc::channel(1);
+            rx
         }
     }
 

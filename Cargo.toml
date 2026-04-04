@@ -12,6 +12,7 @@ hex = "0.4.3"
 mms = { git = "https://github.com/OpenEnergyStack/iso9506-mms" }
 async-trait = "0.1"
 chrono = "0.4"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,8 +1,9 @@
 use crate::client::{DataReference, Error, Transport};
 use crate::types::{
-    BufferedReportControlBlock, DataDefinition, DataType, EntryTime, IECData, ReportOptFields,
-    SetBrcbValuesSettings, SetUrcbValuesSettings, TimeQuality, Timestamp, TriggerOptions,
-    UnbufferedReportControlBlock, UnbufferedReportOptFields,
+    BufferedReportControlBlock, DataDefinition, DataType, EntryTime, IECData, ReasonForInclusion,
+    Report, ReportDataPoint, ReportMetadata, ReportOptFields, ReportType, SetBrcbValuesSettings,
+    SetUrcbValuesSettings, TimeQuality, Timestamp, TriggerOptions, UnbufferedReportControlBlock,
+    UnbufferedReportOptFields,
 };
 use async_trait::async_trait;
 use mms::messages::iso_9506_mms_1::{AnonymousWriteResponse, TypeSpecification, UtcTime};
@@ -1209,6 +1210,263 @@ impl Transport for MmsTransport {
                 None
             },
         })
+    }
+
+    fn subscribe_reports(
+        &self,
+        control_block_ref: String,
+        rpt_id: String,
+        report_type: ReportType,
+    ) -> tokio::sync::mpsc::Receiver<Report> {
+        use mms::messages::iso_9506_mms_1::UnconfirmedService;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut bcast = self.client.handle_unconfirmed();
+
+        tokio::spawn(async move {
+            loop {
+                let msg = match bcast.recv().await {
+                    Ok(m) => m,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+
+                let UnconfirmedService::informationReport(ir) = msg else {
+                    continue;
+                };
+
+                // The list_of_access_result is the flat list of all report fields
+                let fields: Vec<&Data> = ir
+                    .list_of_access_result
+                    .iter()
+                    .filter_map(|ar| {
+                        if let AccessResult::success(d) = ar {
+                            Some(d)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if fields.len() < 2 {
+                    continue;
+                }
+
+                // --- Part 1: Header fields ---
+
+                // Field 0: RptID (VisibleString, always present)
+                let report_rpt_id = match &fields[0] {
+                    Data::visible_string(s) => s.to_string(),
+                    Data::mMSString(s) => s.0.to_string(),
+                    other => {
+                        let _ = other;
+                        continue;
+                    }
+                };
+
+                // Filter: only process reports matching the requested RptID
+                if report_rpt_id != rpt_id {
+                    continue;
+                }
+
+                // Field 1: OptFlds (BitString, always present)
+                let opt_flds = match &fields[1] {
+                    Data::bit_string(bits) => {
+                        let s: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                        ReportOptFields::from_bit_string(&s)
+                    }
+                    other => {
+                        let _ = other;
+                        continue;
+                    }
+                };
+
+                let mut idx = 2usize;
+
+                let seq_num = if opt_flds.sequence_number {
+                    let v = match fields.get(idx) {
+                        Some(Data::unsigned(u)) => u32::try_from(u).ok(),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let time_stamp = if opt_flds.report_time_stamp {
+                    let v = match fields.get(idx) {
+                        Some(Data::binary_time(t)) => time_of_day_to_timestamp(t),
+                        other => {
+                            let _ = other;
+                            continue;
+                        }
+                    };
+                    idx += 1;
+                    Some(v)
+                } else {
+                    None
+                };
+
+                let dat_set = if opt_flds.data_set_name {
+                    let v = match fields.get(idx) {
+                        Some(Data::visible_string(s)) => Some(s.to_string()),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let buf_ovfl = if opt_flds.buffer_overflow {
+                    let v = match fields.get(idx) {
+                        Some(Data::boolean(b)) => Some(*b),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let entry_id = if opt_flds.entry_id {
+                    let v = match fields.get(idx) {
+                        Some(Data::octet_string(o)) => Some(EntryTime(o.as_ref().to_vec())),
+                        Some(Data::binary_time(t)) => Some(EntryTime(t.0.as_ref().to_vec())),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let conf_rev = if opt_flds.conf_revision {
+                    let v = match fields.get(idx) {
+                        Some(Data::unsigned(u)) => u32::try_from(u).ok(),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let sub_seq_num = if opt_flds.segmentation {
+                    let v = match fields.get(idx) {
+                        Some(Data::unsigned(u)) => u32::try_from(u).ok(),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                let more_segments_follow = if opt_flds.segmentation {
+                    let v = match fields.get(idx) {
+                        Some(Data::boolean(b)) => Some(*b),
+                        _ => None,
+                    };
+                    idx += 1;
+                    v
+                } else {
+                    None
+                };
+
+                // Inclusion bitstring (always present) — each set bit means that
+                // dataset member is included in this report
+                let n = match fields.get(idx) {
+                    Some(Data::bit_string(bits)) => {
+                        idx += 1;
+                        bits.iter().filter(|b| **b).count()
+                    }
+                    other => {
+                        let _ = other;
+                        continue;
+                    }
+                };
+
+                // --- Part 2: Data references (one per included member, if enabled) ---
+                let mut data_refs: Vec<Option<String>> = Vec::with_capacity(n);
+                if opt_flds.data_reference {
+                    for _ in 0..n {
+                        let r = match fields.get(idx) {
+                            Some(Data::visible_string(s)) => Some(s.to_string()),
+                            _ => None,
+                        };
+                        data_refs.push(r);
+                        idx += 1;
+                    }
+                } else {
+                    data_refs.resize(n, None);
+                }
+
+                // --- Part 3: Data values (one per included member) ---
+                let mut values: Vec<IECData> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    if let Some(field) = fields.get(idx) {
+                        values.push(mms_data_to_iec(field));
+                    }
+                    idx += 1;
+                }
+
+                // --- Part 4: Reason codes (one per included member, if enabled) ---
+                let mut reasons: Vec<Option<ReasonForInclusion>> = Vec::with_capacity(n);
+                if opt_flds.reason_for_inclusion {
+                    for _ in 0..n {
+                        let reason = match fields.get(idx) {
+                            Some(Data::bit_string(bits)) => {
+                                let byte = bits.as_raw_slice().first().copied().unwrap_or(0);
+                                Some(ReasonForInclusion::from_byte(byte))
+                            }
+                            _ => None,
+                        };
+                        reasons.push(reason);
+                        idx += 1;
+                    }
+                } else {
+                    reasons.resize(n, None);
+                }
+
+                // Combine into data points
+                let data: Vec<ReportDataPoint> = data_refs
+                    .into_iter()
+                    .zip(values)
+                    .zip(reasons)
+                    .map(|((data_reference, value), reason)| ReportDataPoint {
+                        data_reference,
+                        value,
+                        reason,
+                    })
+                    .collect();
+
+                let report = Report {
+                    metadata: ReportMetadata {
+                        report_type: report_type.clone(),
+                        control_block_ref: control_block_ref.clone(),
+                        rpt_id: report_rpt_id,
+                        opt_flds,
+                        seq_num,
+                        time_stamp,
+                        dat_set,
+                        buf_ovfl,
+                        entry_id,
+                        conf_rev,
+                        sub_seq_num,
+                        more_segments_follow,
+                    },
+                    data,
+                };
+
+                if tx.send(report).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        rx
     }
 }
 

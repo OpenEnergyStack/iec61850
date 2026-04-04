@@ -829,6 +829,89 @@ pub struct UnbufferedReportControlBlock {
     pub owner: Option<Vec<u8>>,
 }
 
+/// Whether a report originates from a Buffered (BRCB) or Unbuffered (URCB) report control block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReportType {
+    Buffered,
+    Unbuffered,
+}
+
+/// Per-dataset-member reason why it was included in the report (IEC 61850-7-2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ReasonForInclusion {
+    /// Data value changed (bit 1)
+    pub data_change: bool,
+    /// Quality changed (bit 2)
+    pub quality_change: bool,
+    /// Data updated (bit 3)
+    pub data_update: bool,
+    /// Integrity period scan (bit 4)
+    pub integrity: bool,
+    /// General interrogation (bit 5)
+    pub general_interrogation: bool,
+}
+
+impl ReasonForInclusion {
+    pub fn from_byte(byte: u8) -> Self {
+        ReasonForInclusion {
+            data_change: (byte & 0x40) != 0,
+            quality_change: (byte & 0x20) != 0,
+            data_update: (byte & 0x10) != 0,
+            integrity: (byte & 0x08) != 0,
+            general_interrogation: (byte & 0x04) != 0,
+        }
+    }
+}
+
+/// Header/metadata fields present in every IEC 61850 report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportMetadata {
+    /// Whether this came from a BRCB or URCB
+    pub report_type: ReportType,
+    /// MMS control block reference extracted from `variable_access_specification`,
+    /// e.g. `"BCUApp/LLN0$BR$BRCB01"`
+    pub control_block_ref: String,
+    /// Configured RptID string (data field 0, always present)
+    pub rpt_id: String,
+    /// Reported optional fields bitmask (data field 1, always present)
+    pub opt_flds: ReportOptFields,
+    /// Sequence number — present if `opt_flds.sequence_number`
+    pub seq_num: Option<u32>,
+    /// Report timestamp — present if `opt_flds.report_time_stamp`
+    pub time_stamp: Option<Timestamp>,
+    /// Dataset name — present if `opt_flds.data_set_name`
+    pub dat_set: Option<String>,
+    /// Buffer overflow (BRCB only) — present if `opt_flds.buffer_overflow`
+    pub buf_ovfl: Option<bool>,
+    /// Entry ID (BRCB only) — present if `opt_flds.entry_id`
+    pub entry_id: Option<EntryTime>,
+    /// Configuration revision — present if `opt_flds.conf_revision`
+    pub conf_rev: Option<u32>,
+    /// Sub-sequence number (segmentation) — present if `opt_flds.segmentation`
+    pub sub_seq_num: Option<u32>,
+    /// More segments follow (segmentation) — present if `opt_flds.segmentation`
+    pub more_segments_follow: Option<bool>,
+}
+
+/// A single dataset member value included in a report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportDataPoint {
+    /// MMS data reference (e.g. `"BCUApp/XCBR1$ST$Pos"`) —
+    /// present if `opt_flds.data_reference`
+    pub data_reference: Option<String>,
+    /// The decoded value
+    pub value: IECData,
+    /// Reason this member was included — present if `opt_flds.reason_for_inclusion`
+    pub reason: Option<ReasonForInclusion>,
+}
+
+/// A fully decoded IEC 61850 report produced by `subscribe_reports`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Report {
+    pub metadata: ReportMetadata,
+    pub data: Vec<ReportDataPoint>,
+}
+
 /// Schema node produced by the MMS GetDataDefinition service.
 ///
 /// Combines the element name (from the service response) with a [`DataType`]
