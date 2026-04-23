@@ -5,4 +5,5 @@ pub mod decode_smv;
 pub mod encode_goose;
 pub mod encode_smv;
 pub mod mms;
+pub mod server;
 pub mod types;
