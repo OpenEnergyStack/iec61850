@@ -11,7 +11,9 @@ use std::time::Instant;
 use futures::{SinkExt as _, StreamExt as _};
 use mms::{
     protocol::{self, tpkt::TpktCodec, transport, ProtocolParams},
-    InitiateRequestPDU, InitiateResponsePDU, InitiateResponsePDUInitResponseDetail, MMSpdu,
+    ConfirmedResponsePDU, ConfirmedServiceRequest, ConfirmedServiceResponse,
+    GetNameListRequestObjectScope, GetNameListResponse, Identifier, InitiateRequestPDU,
+    InitiateResponsePDU, InitiateResponsePDUInitResponseDetail, MMSpdu, Unsigned32, VisibleString,
 };
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -21,7 +23,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use super::server::{Association, AssociationMap, Backend, ServerTlsConfig};
-use crate::server::ServerModel;
+use crate::server::model::ServerModel;
 
 // ── MMS service vocabulary ───────────────────────────────────────────────────────────────
 
@@ -104,7 +106,7 @@ impl Backend for MmsServer {
                 // Wrap in the unified transport type before the MMS handshake.
                 let transport = match tls {
                     Some(cfg) => match TlsAcceptor::from(cfg).accept(stream).await {
-                        Ok(s) => TransportStream::Tls(s),
+                        Ok(s) => TransportStream::Tls(Box::new(s)),
                         Err(e) => {
                             eprintln!("[iec61850] TLS error: {e}");
                             return;
@@ -169,15 +171,12 @@ async fn serve(mut conn: Connection, model: Arc<ServerModel>) -> Result<(), Erro
     }
 }
 
-fn dispatch(req: ServiceRequest, _model: &ServerModel) -> Option<ServiceResponse> {
+fn dispatch(req: ServiceRequest, model: &ServerModel) -> Option<ServiceResponse> {
     match req {
-        ServiceRequest::GetServerDirectory { invoke_id } => {
-            // TODO: populate from model
-            Some(ServiceResponse::NameList {
-                invoke_id,
-                names: vec![],
-            })
-        }
+        ServiceRequest::GetServerDirectory { invoke_id } => Some(ServiceResponse::NameList {
+            invoke_id,
+            names: model.get_server_directory(),
+        }),
         ServiceRequest::Unknown { .. } => None,
     }
 }
@@ -222,7 +221,7 @@ impl From<mms::Error> for Error {
 
 enum TransportStream {
     Plain(tokio::net::TcpStream),
-    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl AsyncRead for TransportStream {
@@ -233,7 +232,7 @@ impl AsyncRead for TransportStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -246,19 +245,19 @@ impl AsyncWrite for TransportStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_flush(cx),
-            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -343,17 +342,38 @@ impl Connection {
 
 fn mms_to_service(pdu: MMSpdu) -> Option<ServiceRequest> {
     match pdu {
-        MMSpdu::confirmed_RequestPDU(_req) => {
-            // TODO: decode service type and extract invokeID from _req
-            Some(ServiceRequest::Unknown { invoke_id: 0 })
+        MMSpdu::confirmed_RequestPDU(req) => {
+            let invoke_id = req.invoke_id.0;
+            match req.service {
+                ConfirmedServiceRequest::getNameList(name_req) => match name_req.object_scope {
+                    GetNameListRequestObjectScope::vmdSpecific(_) => {
+                        Some(ServiceRequest::GetServerDirectory { invoke_id })
+                    }
+                    _ => Some(ServiceRequest::Unknown { invoke_id }),
+                },
+                _ => Some(ServiceRequest::Unknown { invoke_id }),
+            }
         }
         _ => None,
     }
 }
 
-fn service_to_mms(_resp: ServiceResponse) -> Option<MMSpdu> {
-    // TODO: encode ServiceResponse variants into ConfirmedResponsePDU
-    None
+fn service_to_mms(resp: ServiceResponse) -> Option<MMSpdu> {
+    match resp {
+        ServiceResponse::NameList { invoke_id, names } => {
+            let list_of_identifier = names
+                .iter()
+                .map(|n| Identifier(VisibleString::try_from(n.as_str()).expect("valid identifier")))
+                .collect();
+            Some(MMSpdu::confirmed_ResponsePDU(ConfirmedResponsePDU {
+                invoke_id: Unsigned32(invoke_id),
+                service: ConfirmedServiceResponse::getNameList(GetNameListResponse {
+                    list_of_identifier,
+                    more_follows: false,
+                }),
+            }))
+        }
+    }
 }
 
 fn build_initiate_response(req: &InitiateRequestPDU) -> InitiateResponsePDU {

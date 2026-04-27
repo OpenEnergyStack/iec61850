@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use iec_61850::{
     client::ClientBuilder,
-    server::{Mapping, Server, ServerModel},
+    server::{Mapping, Server},
 };
 
 const SETTLE: Duration = Duration::from_millis(100);
 
-fn model(max_associations: u8) -> ServerModel {
-    ServerModel::new("TEST_IED".into(), max_associations)
+fn model_json(max_associations: u8) -> String {
+    format!(r#"{{"ied_name":"TEST_IED","config":{{"max_associations":{max_associations}}}}}"#)
 }
 
 /// Bind an ephemeral server, return it together with the chosen port.
@@ -35,7 +35,7 @@ async fn bare_connect_establishes_association() {
     let (server, port) = bind_server().await;
     let associations = server.associations();
 
-    tokio::spawn(server.run(model(10)));
+    tokio::spawn(server.run(model_json(10)));
 
     let _client = ClientBuilder::new()
         .timeout(Duration::from_secs(5))
@@ -58,7 +58,7 @@ async fn disconnect_removes_association() {
     let (server, port) = bind_server().await;
     let associations = server.associations();
 
-    tokio::spawn(server.run(model(10)));
+    tokio::spawn(server.run(model_json(10)));
 
     let client = ClientBuilder::new()
         .timeout(Duration::from_secs(5))
@@ -90,7 +90,7 @@ async fn server_enforces_max_associations() {
     let (server, port) = bind_server().await;
     let associations = server.associations();
 
-    tokio::spawn(server.run(model(1)));
+    tokio::spawn(server.run(model_json(1)));
 
     // First client succeeds.
     let _first = ClientBuilder::new()

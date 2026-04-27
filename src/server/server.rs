@@ -93,8 +93,10 @@ impl Server {
         }
     }
 
-    // Start the server
-    pub async fn run(self, model: ServerModel) -> Result<(), std::io::Error> {
+    /// Start the server with a JSON model string.
+    pub async fn run(self, model_json: String) -> Result<(), std::io::Error> {
+        let model = ServerModel::from_json(&model_json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         match self.inner {
             Inner::Mms(s) => s.run(model).await,
         }
