@@ -16,13 +16,102 @@ const SETTLE: Duration = Duration::from_millis(100);
 const DEMO_MODEL: &str = r#"{
     "ied_name": "TestIED",
     "logical_devices": [
-        {"inst": "Array",       "name": "MyArray",       "logical_nodes": []},
-        {"inst": "SwitchGear",  "name": "mySwitchGear",  "logical_nodes": []},
-        {"inst": "Measurement", "name": "MyMeasurement", "logical_nodes": []},
-        {"inst": "Protection",  "name": "MyProtection",  "logical_nodes": []},
-        {"inst": "Transformer", "name": "MyTransformer", "logical_nodes": []}
+        {
+            "inst": "Array",
+            "logical_nodes": [
+                {
+                    "prefix": "", "ln_class": "LLN0", "inst": "",
+                    "data_objects": [
+                        { "name": "Beh", "children": [
+                            { "type": "Attribute", "fc": "ST", "name": "stVal", "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "q",     "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "t",     "children": [] }
+                        ]}
+                    ]
+                }
+            ]
+        },
+        {
+            "inst": "SwitchGear",
+            "logical_nodes": [
+                {
+                    "prefix": "", "ln_class": "LLN0", "inst": "",
+                    "data_objects": [
+                        { "name": "Beh", "children": [
+                            { "type": "Attribute", "fc": "ST", "name": "stVal", "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "q",     "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "t",     "children": [] }
+                        ]}
+                    ]
+                }
+            ]
+        },
+        {
+            "inst": "Measurement",
+            "logical_nodes": [
+                {
+                    "prefix": "", "ln_class": "LLN0", "inst": "",
+                    "data_objects": [
+                        { "name": "Beh", "children": [
+                            { "type": "Attribute", "fc": "ST", "name": "stVal", "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "q",     "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "t",     "children": [] }
+                        ]}
+                    ]
+                },
+                {
+                    "prefix": "My", "ln_class": "MMXU", "inst": "1",
+                    "data_objects": [
+                        { "name": "A", "children": [
+                            { "type": "SubObject", "name": "phsA", "children": [
+                                { "type": "Attribute", "name": "cVal", "fc": "MX", "children": [
+                                    { "name": "mag", "fc": "MX", "children": [
+                                        { "name": "f", "fc": "MX", "children": [] }
+                                    ]},
+                                    { "name": "ang", "fc": "MX", "children": [
+                                        { "name": "f", "fc": "MX", "children": [] }
+                                    ]}
+                                ]},
+                                { "type": "Attribute", "name": "q", "fc": "MX", "children": [] },
+                                { "type": "Attribute", "name": "t", "fc": "MX", "children": [] }
+                            ]}
+                        ]}
+                    ]
+                }
+            ]
+        },
+        {
+            "inst": "Protection",
+            "logical_nodes": [
+                {
+                    "prefix": "", "ln_class": "LLN0", "inst": "",
+                    "data_objects": [
+                        { "name": "Beh", "children": [
+                            { "type": "Attribute", "fc": "ST", "name": "stVal", "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "q",     "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "t",     "children": [] }
+                        ]}
+                    ]
+                }
+            ]
+        },
+        {
+            "inst": "Transformer",
+            "logical_nodes": [
+                {
+                    "prefix": "", "ln_class": "LLN0", "inst": "",
+                    "data_objects": [
+                        { "name": "Beh", "children": [
+                            { "type": "Attribute", "fc": "ST", "name": "stVal", "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "q",     "children": [] },
+                            { "type": "Attribute", "fc": "ST", "name": "t",     "children": [] }
+                        ]}
+                    ]
+                }
+            ]
+        }
     ],
-    "config": {"max_associations": 5}
+    "config": { "max_associations": 5 }
 }"#;
 
 async fn bind_demo_server() -> (Server, u16) {
@@ -194,5 +283,164 @@ async fn get_server_directory_consistent_across_clients() {
     assert_eq!(
         dir_a, dir_b,
         "both clients should see the same server directory"
+    );
+}
+
+// ── get_logical_device_directory tests ───────────────────────────────────────
+
+/// A simple LD (LLN0 + Beh DO) returns exactly the three leaf DA paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logical_device_directory_returns_leaf_paths_for_simple_ld() {
+    let (server, port) = bind_demo_server().await;
+    tokio::spawn(server.run(DEMO_MODEL.to_string()));
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect("127.0.0.1", port)
+        .await
+        .expect("client connect failed");
+
+    tokio::time::sleep(SETTLE).await;
+
+    let directory = client
+        .get_logical_device_directory("TestIEDArray".to_string())
+        .await
+        .expect("get_logical_device_directory failed");
+
+    assert_eq!(
+        directory,
+        vec!["LLN0$ST$Beh$stVal", "LLN0$ST$Beh$q", "LLN0$ST$Beh$t"],
+        "unexpected directory for TestIEDArray: {directory:?}"
+    );
+}
+
+/// The FC is inserted after the LN name and before the DO path.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logical_device_directory_fc_position_is_correct() {
+    let (server, port) = bind_demo_server().await;
+    tokio::spawn(server.run(DEMO_MODEL.to_string()));
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect("127.0.0.1", port)
+        .await
+        .expect("client connect failed");
+
+    tokio::time::sleep(SETTLE).await;
+
+    let directory = client
+        .get_logical_device_directory("TestIEDArray".to_string())
+        .await
+        .expect("get_logical_device_directory failed");
+
+    for entry in &directory {
+        let parts: Vec<&str> = entry.splitn(3, '$').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "entry '{entry}' does not have 3 dollar-delimited segments"
+        );
+        // parts[0] = LN name, parts[1] = FC, parts[2] = DO$...$DA
+        assert!(
+            [
+                "ST", "MX", "SP", "CF", "DC", "EX", "BR", "RP", "LG", "GO", "SV", "TI", "IN", "CO",
+                "SE", "SF"
+            ]
+            .contains(&parts[1]),
+            "second segment '{p}' in '{entry}' is not a valid FC",
+            p = parts[1]
+        );
+    }
+}
+
+/// An LD with two LNs (LLN0 and MyMMXU1) returns entries for both,
+/// including correct paths through an SDO and a struct-typed DA.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logical_device_directory_with_sdo_and_struct_da() {
+    let (server, port) = bind_demo_server().await;
+    tokio::spawn(server.run(DEMO_MODEL.to_string()));
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect("127.0.0.1", port)
+        .await
+        .expect("client connect failed");
+
+    tokio::time::sleep(SETTLE).await;
+
+    let directory = client
+        .get_logical_device_directory("TestIEDMeasurement".to_string())
+        .await
+        .expect("get_logical_device_directory failed");
+
+    // LLN0 entries come first
+    assert!(directory.contains(&"LLN0$ST$Beh$stVal".to_string()));
+    assert!(directory.contains(&"LLN0$ST$Beh$q".to_string()));
+    assert!(directory.contains(&"LLN0$ST$Beh$t".to_string()));
+
+    // MyMMXU1: SDO phsA, struct DA cVal with BDAs mag.f and ang.f, plus leaf q and t
+    assert!(directory.contains(&"MyMMXU1$MX$A$phsA$cVal$mag$f".to_string()));
+    assert!(directory.contains(&"MyMMXU1$MX$A$phsA$cVal$ang$f".to_string()));
+    assert!(directory.contains(&"MyMMXU1$MX$A$phsA$q".to_string()));
+    assert!(directory.contains(&"MyMMXU1$MX$A$phsA$t".to_string()));
+
+    assert_eq!(directory.len(), 7, "unexpected entry count: {directory:?}");
+}
+
+/// The declaration order of LN → DO → DA is preserved in the response.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logical_device_directory_preserves_declaration_order() {
+    let (server, port) = bind_demo_server().await;
+    tokio::spawn(server.run(DEMO_MODEL.to_string()));
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect("127.0.0.1", port)
+        .await
+        .expect("client connect failed");
+
+    tokio::time::sleep(SETTLE).await;
+
+    let directory = client
+        .get_logical_device_directory("TestIEDMeasurement".to_string())
+        .await
+        .expect("get_logical_device_directory failed");
+
+    assert_eq!(
+        directory,
+        vec![
+            "LLN0$ST$Beh$stVal",
+            "LLN0$ST$Beh$q",
+            "LLN0$ST$Beh$t",
+            "MyMMXU1$MX$A$phsA$cVal$mag$f",
+            "MyMMXU1$MX$A$phsA$cVal$ang$f",
+            "MyMMXU1$MX$A$phsA$q",
+            "MyMMXU1$MX$A$phsA$t",
+        ]
+    );
+}
+
+/// Querying an LD that does not exist returns an empty list.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_logical_device_directory_unknown_ld_returns_empty() {
+    let (server, port) = bind_demo_server().await;
+    tokio::spawn(server.run(DEMO_MODEL.to_string()));
+
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect("127.0.0.1", port)
+        .await
+        .expect("client connect failed");
+
+    tokio::time::sleep(SETTLE).await;
+
+    let directory = client
+        .get_logical_device_directory("TestIEDDoesNotExist".to_string())
+        .await
+        .expect("get_logical_device_directory failed");
+
+    assert!(
+        directory.is_empty(),
+        "expected empty list for unknown LD, got: {directory:?}"
     );
 }

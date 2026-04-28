@@ -23,7 +23,9 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use super::server::{Association, AssociationMap, Backend, ServerTlsConfig};
-use crate::server::model::ServerModel;
+use crate::server::model::{
+    DataAttributeNode, DataObjectChild, FunctionalConstraint, LogicalDeviceNode, ServerModel,
+};
 
 // ── MMS service vocabulary ───────────────────────────────────────────────────────────────
 
@@ -31,11 +33,17 @@ use crate::server::model::ServerModel;
 type InvokeId = u32;
 
 /// A decoded IEC 61850 service request.
-#[allow(dead_code)]
 enum ServiceRequest {
-    GetServerDirectory { invoke_id: InvokeId },
-    // TODO: GetLogicalDeviceDirectory, GetDataValues, SetDataValues, …
-    Unknown { invoke_id: InvokeId },
+    GetServerDirectory {
+        invoke_id: InvokeId,
+    },
+    GetLogicalDeviceDirectory {
+        invoke_id: InvokeId,
+        ld_name: String,
+    },
+    Unknown {
+        _invoke_id: InvokeId,
+    },
 }
 
 /// An IEC 61850 service response to encode and send.
@@ -177,6 +185,12 @@ fn dispatch(req: ServiceRequest, model: &ServerModel) -> Option<ServiceResponse>
             invoke_id,
             names: model.get_server_directory(),
         }),
+        ServiceRequest::GetLogicalDeviceDirectory { invoke_id, ld_name } => {
+            Some(ServiceResponse::NameList {
+                invoke_id,
+                names: ld_directory(&model.ied_name, &model.logical_devices, &ld_name),
+            })
+        }
         ServiceRequest::Unknown { .. } => None,
     }
 }
@@ -349,9 +363,19 @@ fn mms_to_service(pdu: MMSpdu) -> Option<ServiceRequest> {
                     GetNameListRequestObjectScope::vmdSpecific(_) => {
                         Some(ServiceRequest::GetServerDirectory { invoke_id })
                     }
-                    _ => Some(ServiceRequest::Unknown { invoke_id }),
+                    GetNameListRequestObjectScope::domainSpecific(id) => {
+                        Some(ServiceRequest::GetLogicalDeviceDirectory {
+                            invoke_id,
+                            ld_name: id.0.to_string(),
+                        })
+                    }
+                    _ => Some(ServiceRequest::Unknown {
+                        _invoke_id: invoke_id,
+                    }),
                 },
-                _ => Some(ServiceRequest::Unknown { invoke_id }),
+                _ => Some(ServiceRequest::Unknown {
+                    _invoke_id: invoke_id,
+                }),
             }
         }
         _ => None,
@@ -372,6 +396,71 @@ fn service_to_mms(resp: ServiceResponse) -> Option<MMSpdu> {
                     more_follows: false,
                 }),
             }))
+        }
+    }
+}
+
+// ── MMS logical-device directory ─────────────────────────────────────────────
+
+/// Build the MMS GetNameList response list for a logical device.
+///
+/// Walks the structural tree and returns one entry per leaf DA in
+/// MMS dollar-notation: `{LN}${FC}${DO}[${SDO}]*${DA}[${BDA}]*`
+///
+/// Example: `LLN0$ST$Beh$stVal`, `MMXU1$MX$A$phsA$instVal$mag$f`
+fn ld_directory(
+    ied_name: &str,
+    logical_devices: &[LogicalDeviceNode],
+    ld_domain: &str,
+) -> Vec<String> {
+    let ld_inst = ld_domain.strip_prefix(ied_name).unwrap_or(ld_domain);
+    let Some(ld) = logical_devices.iter().find(|ld| ld.inst == ld_inst) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for ln in &ld.logical_nodes {
+        let ln_name = format!("{}{}{}", ln.prefix, ln.ln_class, ln.inst);
+        for do_ in &ln.data_objects {
+            collect_do_paths(&ln_name, &do_.name, &do_.children, &mut result);
+        }
+    }
+    result
+}
+
+/// Walk the children of a DO or SDO, accumulating leaf DA paths.
+fn collect_do_paths(
+    ln_name: &str,
+    do_path: &str,
+    children: &[DataObjectChild],
+    result: &mut Vec<String>,
+) {
+    for child in children {
+        match child {
+            DataObjectChild::Attribute(da) => collect_da_paths(ln_name, do_path, da.fc, da, result),
+            DataObjectChild::SubObject(sdo) => {
+                let sub_path = format!("{}${}", do_path, sdo.name);
+                collect_do_paths(ln_name, &sub_path, &sdo.children, result);
+            }
+        }
+    }
+}
+
+/// Walk a DA node, emitting one path entry per leaf.
+/// The FC is the functional constraint of the top-level DA ancestor and is
+/// inserted between the LN name and the DO path.
+fn collect_da_paths(
+    ln_name: &str,
+    parent_path: &str,
+    fc: FunctionalConstraint,
+    da: &DataAttributeNode,
+    result: &mut Vec<String>,
+) {
+    let da_path = format!("{}${}", parent_path, da.name);
+    if da.children.is_empty() {
+        result.push(format!("{}${}${}", ln_name, fc.as_str(), da_path));
+    } else {
+        for child in &da.children {
+            collect_da_paths(ln_name, &da_path, fc, child, result);
         }
     }
 }
