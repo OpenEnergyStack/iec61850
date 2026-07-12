@@ -1,14 +1,16 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use iec_61850_lib::decode_smv::decode_smv;
-use iec_61850_lib::encode_smv::encode_smv;
-use iec_61850_lib::types::{EthernetHeader, Sample, SavAsdu, SavPdu};
+use iec_61850::decode_smv::decode_smv;
+use iec_61850::encode_smv::encode_smv;
+use iec_61850::types::{
+    EthernetHeader, Quality, Sample, SavAsdu, SavDataSetConfig, SavPdu, SavValueConfig, Validity,
+};
 
 /// Diagnostic function to validate packet structure
-fn validate_packet(packet: &[u8], name: &str) {
+fn validate_packet(packet: &[u8], name: &str, config: &SavDataSetConfig) {
     println!("\n=== Validating {} ===", name);
     println!("Packet size: {} bytes", packet.len());
 
-    match decode_smv(packet, 22) {
+    match decode_smv(packet, 22, &config) {
         Ok(pdu) => {
             println!("✓ Successfully decoded PDU");
             println!("  Number of ASDUs: {}", pdu.no_asdu);
@@ -38,33 +40,31 @@ fn encode_samples(buffer: &mut Vec<u8>, num_samples: usize, start_value: i32) {
         let value = start_value + (i as i32 * 100);
         let value_bytes = value.to_be_bytes();
 
-        // Find the minimum number of bytes needed (BER compression)
-        let mut start_idx = 0;
-        for j in 0..3 {
-            if value >= 0 && value_bytes[j] == 0 && (value_bytes[j + 1] & 0x80) == 0 {
-                start_idx = j + 1;
-            } else if value < 0 && value_bytes[j] == 0xFF && (value_bytes[j + 1] & 0x80) != 0 {
-                start_idx = j + 1;
-            } else {
-                break;
-            }
-        }
-        let compressed_bytes = &value_bytes[start_idx..];
-
-        // INT32 with tag 0x83
-        buffer.push(0x83);
-        buffer.push(compressed_bytes.len() as u8);
-        buffer.extend_from_slice(compressed_bytes);
+        // INT32
+        buffer.extend_from_slice(&value_bytes);
 
         // BITSTRING with tag 0x84 (13-bit quality in 2 bytes + 1 byte for unused bits)
-        let quality_13bit: u16 = 0x0000; // good quality (all zeros)
-        let quality_with_padding = quality_13bit << 3;
+        let quality_13bit = 0_i32.to_be_bytes();
 
-        buffer.push(0x84);
-        buffer.push(3); // length: 1 (unused bits) + 2 (quality bytes)
-        buffer.push(3); // 3 unused bits
-        buffer.extend_from_slice(&quality_with_padding.to_be_bytes());
+        buffer.extend_from_slice(&quality_13bit);
     }
+}
+
+fn config(samples: usize) -> SavDataSetConfig {
+    SavDataSetConfig::new(vec![SavValueConfig::new(0.01); samples])
+}
+
+fn config_92le() -> SavDataSetConfig {
+    SavDataSetConfig::new(vec![
+        SavValueConfig::new(0.001),
+        SavValueConfig::new(0.001),
+        SavValueConfig::new(0.001),
+        SavValueConfig::new(0.001),
+        SavValueConfig::new(0.01),
+        SavValueConfig::new(0.01),
+        SavValueConfig::new(0.01),
+        SavValueConfig::new(0.01),
+    ])
 }
 
 /// Create a maximum stress test SMV packet: 8 ASDUs with 32 samples each
@@ -312,7 +312,7 @@ fn create_max_realistic_smv_packet() -> Vec<u8> {
 }
 
 /// Create a realistic SMV packet for benchmarking (single ASDU, 8 samples)
-fn create_sample_smv_packet() -> Vec<u8> {
+fn create_92le_sample_smv_packet() -> Vec<u8> {
     // Ethernet header (14 bytes without VLAN)
     let mut packet = vec![
         // Destination MAC
@@ -359,55 +359,28 @@ fn create_sample_smv_packet() -> Vec<u8> {
     packet.push(0x87);
     packet.push(72);
 
-    // 8 samples: each is ASN.1 BER encoded INT32 (tag 0x83) + BER encoded BITSTRING (tag 0x84)
-    for i in 0..8 {
-        let value = (10000 + i * 1000) as i32;
-        let value_bytes = value.to_be_bytes();
+    // sample values (tag 0x87) - encode samples first to get actual size
+    let mut samples_data = Vec::new();
+    encode_samples(&mut samples_data, 8, 10000 + (1 as i32 * 5000));
 
-        // Find the minimum number of bytes needed (BER compression)
-        let mut start_idx = 0;
-        for j in 0..3 {
-            if value >= 0 && value_bytes[j] == 0 && (value_bytes[j + 1] & 0x80) == 0 {
-                start_idx = j + 1;
-            } else if value < 0 && value_bytes[j] == 0xFF && (value_bytes[j + 1] & 0x80) != 0 {
-                start_idx = j + 1;
-            } else {
-                break;
-            }
-        }
-        let compressed_bytes = &value_bytes[start_idx..];
-
-        // INT32 with tag 0x83
-        packet.push(0x83);
-        packet.push(compressed_bytes.len() as u8);
-        packet.extend_from_slice(compressed_bytes);
-
-        // BITSTRING with tag 0x84 (13-bit quality in 2 bytes + 1 byte for unused bits)
-        let quality_13bit: u16 = 0x0000; // good quality (all zeros)
-        let quality_with_padding = quality_13bit << 3; // Shift left by 3 to add padding
-
-        packet.push(0x84);
-        packet.push(3); // length: 1 (unused bits) + 2 (quality bytes)
-        packet.push(3); // 3 unused bits
-        packet.extend_from_slice(&quality_with_padding.to_be_bytes());
-    }
+    packet.extend_from_slice(&samples_data);
 
     packet
 }
 
-fn benchmark_full_smv_decode(c: &mut Criterion) {
-    let packet = create_sample_smv_packet();
+fn benchmark_92le_smv_decode(c: &mut Criterion) {
+    let packet = create_92le_sample_smv_packet();
 
     c.bench_function("full_smv_decode", |b| {
         b.iter(|| {
             // Skip Ethernet header (14 bytes) and 8-byte SMV header
-            decode_smv(black_box(&packet), black_box(22))
+            decode_smv(black_box(&packet), black_box(22), &config_92le())
         });
     });
 }
 
 fn benchmark_throughput(c: &mut Criterion) {
-    let packet = create_sample_smv_packet();
+    let packet = create_92le_sample_smv_packet();
 
     let mut group = c.benchmark_group("smv_throughput");
 
@@ -417,7 +390,7 @@ fn benchmark_throughput(c: &mut Criterion) {
             BenchmarkId::new("decode_rate_kHz", rate_khz),
             rate_khz,
             |b, _| {
-                b.iter(|| decode_smv(black_box(&packet), black_box(22)));
+                b.iter(|| decode_smv(black_box(&packet), black_box(22), &config_92le()));
             },
         );
 
@@ -432,8 +405,8 @@ fn benchmark_max_stress_decode(c: &mut Criterion) {
     let packet_stress = create_max_stress_smv_packet();
 
     // Validate packets first
-    validate_packet(&packet_realistic, "Realistic Max (8×12)");
-    validate_packet(&packet_stress, "Stress Test (8×32)");
+    validate_packet(&packet_realistic, "Realistic Max (8×12)", &config(12));
+    validate_packet(&packet_stress, "Stress Test (8×32)", &config(32));
 
     // Print packet information
     println!("\n=== SMV Packet Configurations ===");
@@ -465,18 +438,18 @@ fn benchmark_max_stress_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("max_configurations");
 
     group.bench_function("realistic_max_8x12", |b| {
-        b.iter(|| decode_smv(black_box(&packet_realistic), black_box(22)));
+        b.iter(|| decode_smv(black_box(&packet_realistic), black_box(22), &config(12)));
     });
 
     group.bench_function("stress_test_8x32", |b| {
-        b.iter(|| decode_smv(black_box(&packet_stress), black_box(22)));
+        b.iter(|| decode_smv(black_box(&packet_stress), black_box(22), &config(32)));
     });
 
     group.finish();
 }
 
 fn benchmark_decode_comparison(c: &mut Criterion) {
-    let small_packet = create_sample_smv_packet(); // 1 ASDU, 8 samples
+    let small_packet = create_92le_sample_smv_packet(); // 1 ASDU, 8 samples
     let realistic_packet = create_max_realistic_smv_packet(); // 8 ASDUs, 12 samples each
     let large_packet = create_max_stress_smv_packet(); // 8 ASDUs, 32 samples each
 
@@ -511,15 +484,15 @@ fn benchmark_decode_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("smv_packet_comparison");
 
     group.bench_function("small_1x8", |b| {
-        b.iter(|| decode_smv(black_box(&small_packet), black_box(22)));
+        b.iter(|| decode_smv(black_box(&small_packet), black_box(22), &config_92le()));
     });
 
     group.bench_function("realistic_8x12", |b| {
-        b.iter(|| decode_smv(black_box(&realistic_packet), black_box(22)));
+        b.iter(|| decode_smv(black_box(&realistic_packet), black_box(22), &config(12)));
     });
 
     group.bench_function("stress_8x32", |b| {
-        b.iter(|| decode_smv(black_box(&large_packet), black_box(22)));
+        b.iter(|| decode_smv(black_box(&large_packet), black_box(22), &config(32)));
     });
 
     group.finish();
@@ -527,15 +500,26 @@ fn benchmark_decode_comparison(c: &mut Criterion) {
 
 /// Helper function to create sample data for encoding benchmarks
 fn create_sample_pdu(num_asdus: usize, samples_per_asdu: usize) -> SavPdu {
+    const QUALITY: Quality = Quality {
+        validity: Validity::Good,
+        overflow: false,
+        out_of_range: true,
+        bad_reference: false,
+        oscillatory: false,
+        failure: true,
+        old_data: false,
+        inconsistent: true,
+        inaccurate: false,
+        source_substituted: true,
+        test: false,
+        operator_blocked: true,
+    };
     let mut sav_asdu = Vec::new();
 
     for i in 0..num_asdus {
         let mut samples = Vec::new();
         for j in 0..samples_per_asdu {
-            samples.push(Sample::new(
-                1000 + (i * 100 + j) as i32,
-                0x0000, // good quality
-            ));
+            samples.push(Sample::new(10.00 + (i * 100 + j) as f32, QUALITY, 0.01));
         }
 
         sav_asdu.push(SavAsdu {
@@ -663,21 +647,21 @@ fn benchmark_smv_roundtrip(c: &mut Criterion) {
     group.bench_function("small_1x8", |b| {
         b.iter(|| {
             let encoded = encode_smv(black_box(&header), black_box(&small_pdu)).unwrap();
-            decode_smv(black_box(&encoded), black_box(22))
+            decode_smv(black_box(&encoded), black_box(22), &config_92le())
         });
     });
 
     group.bench_function("realistic_8x12", |b| {
         b.iter(|| {
             let encoded = encode_smv(black_box(&header), black_box(&realistic_pdu)).unwrap();
-            decode_smv(black_box(&encoded), black_box(22))
+            decode_smv(black_box(&encoded), black_box(22), &config(12))
         });
     });
 
     group.bench_function("stress_8x32", |b| {
         b.iter(|| {
             let encoded = encode_smv(black_box(&header), black_box(&stress_pdu)).unwrap();
-            decode_smv(black_box(&encoded), black_box(22))
+            decode_smv(black_box(&encoded), black_box(22), &config(32))
         });
     });
 
@@ -686,7 +670,7 @@ fn benchmark_smv_roundtrip(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    benchmark_full_smv_decode,
+    benchmark_92le_smv_decode,
     benchmark_throughput,
     benchmark_max_stress_decode,
     benchmark_decode_comparison,
