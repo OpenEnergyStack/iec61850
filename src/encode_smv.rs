@@ -332,15 +332,16 @@ fn encode_tag_length(
 
 /// Encodes a sample (value + quality) as ASN.1 BER sequence
 fn encode_sample(buffer: &mut [u8], mut pos: usize, sample: &Sample) -> Result<usize, EncodeError> {
-    // Int32 value
-    let value_int32 = (sample.value / sample.scale_factor).round() as i32;
+    let scaled = (sample.value / sample.scale_factor).round();
 
-    if value_int32 < i32::MIN || value_int32 > i32::MAX {
+    if scaled < i32::MIN as f32 || scaled > i32::MAX as f32 {
         return Err(EncodeError::new(
             "Sample value is out of range for 32-bit signed integer after scaling.",
             pos,
         ));
     }
+
+    let value_int32 = scaled as i32;
 
     let bytes = value_int32.to_be_bytes();
     buffer[pos..pos + 4].copy_from_slice(&bytes);
