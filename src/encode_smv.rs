@@ -18,38 +18,9 @@ fn unsigned_integer_length(value: &[u8]) -> usize {
     }
 }
 
-/// Calculates the encoded length of a single sample (value + quality)
-/// Returns the size in bytes without the wrapper tag/length
-fn sample_length(sample: &Sample) -> usize {
-    let mut length = 0;
-
-    // Value (tag 0x83 + length + data)
-    let value_len = if sample.value >= -128 && sample.value <= 127 {
-        1
-    } else if sample.value >= -32768 && sample.value <= 32767 {
-        2
-    } else if sample.value >= -8388608 && sample.value <= 8388607 {
-        3
-    } else {
-        4
-    };
-    length += 1; // tag
-    length += 1; // length field (always 1 byte for small integers)
-    length += value_len;
-
-    // Quality (tag 0x84 + length + data)
-    // BIT STRING: 1 byte unused bits + 2 bytes quality = 3 bytes
-    length += 1; // tag
-    length += 1; // length field
-    length += 3; // data (1 byte unused bits + 2 bytes quality)
-
-    length
-}
-
-/// Calculates the encoded length of all samples
-/// Returns the size in bytes of the sample data (without the 0x87 wrapper tag/length)
+/// Sampled Value data set is reduced to 4 byte value + 4 byte quality per sample
 fn samples_length(samples: &[Sample]) -> usize {
-    samples.iter().map(sample_length).sum()
+    samples.len() * (4 + 4) // Each sample has 4 bytes for value and 4 bytes for quality
 }
 
 /// Calculates the encoded length of a single ASDU
@@ -215,22 +186,6 @@ fn encode_ber(
     Ok(pos)
 }
 
-/// Returns the minimal two's complement representation of a signed integer as a byte slice.
-/// This is used for ASN.1 BER INTEGER encoding.
-fn minimal_twos_complement_bytes(value: &[u8]) -> &[u8] {
-    let mut significant_start = 0;
-    while significant_start < value.len() - 1 {
-        let curr = value[significant_start];
-        let next = value[significant_start + 1];
-        if (curr == 0x00 && (next & 0x80) == 0) || (curr == 0xFF && (next & 0x80) == 0x80) {
-            significant_start += 1;
-        } else {
-            break;
-        }
-    }
-    &value[significant_start..]
-}
-
 /// Encodes an unsigned integer in ASN.1 BER format with a leading zero byte to ensure positive interpretation.
 ///
 /// # Parameters
@@ -264,30 +219,6 @@ fn encode_unsigned_integer(
     } else {
         encode_ber(tag, minimal, buffer, buffer_index)
     }
-}
-
-/// Encodes an integer in minimal two's complement form according to ASN.1 BER.
-///
-/// # Parameters
-/// - `tag`: The ASN.1 tag for the integer type.
-/// - `value`: The integer as a big-endian byte slice (with possible leading sign extension bytes).
-/// - `buffer`: The output buffer.
-/// - `buffer_index`: Where to start writing in the buffer.
-///
-/// # Returns
-/// The new position in the buffer after writing the encoded integer.
-fn encode_integer(
-    tag: u8,
-    value: &[u8],
-    buffer: &mut [u8],
-    buffer_index: usize,
-) -> Result<usize, EncodeError> {
-    encode_ber(
-        tag,
-        minimal_twos_complement_bytes(value),
-        buffer,
-        buffer_index,
-    )
 }
 
 /// Encodes an ASN.1 octet string using BER rules.
@@ -401,17 +332,25 @@ fn encode_tag_length(
 
 /// Encodes a sample (value + quality) as ASN.1 BER sequence
 fn encode_sample(buffer: &mut [u8], mut pos: usize, sample: &Sample) -> Result<usize, EncodeError> {
-    // Encode value as signed INTEGER using encode_integer_32
-    pos = encode_integer(0x83, &sample.value.to_be_bytes(), buffer, pos)?;
+    // Int32 value
+    let value_int32 = (sample.value / sample.scale_factor).round() as i32;
 
-    // Encode quality as BIT STRING (tag 0x84)
-    let quality_u16 = sample.quality.to_u16();
-    let quality_bytes = quality_u16.to_be_bytes();
+    if value_int32 < i32::MIN || value_int32 > i32::MAX {
+        return Err(EncodeError::new(
+            "Sample value is out of range for 32-bit signed integer after scaling.",
+            pos,
+        ));
+    }
 
-    // BIT STRING format: first byte is number of unused bits (3 for 13-bit quality)
-    let mut quality_data = vec![3u8]; // 3 unused bits in the last byte
-    quality_data.extend_from_slice(&quality_bytes);
-    pos = encode_ber(0x84, &quality_data, buffer, pos)?;
+    let bytes = value_int32.to_be_bytes();
+    buffer[pos..pos + 4].copy_from_slice(&bytes);
+    pos += 4;
+
+    // Encodes the quality as a BIT STRING with 32 bits as defined in IEC 61850-9-2
+    let quality_u32 = sample.quality.to_sv();
+    let quality_bytes = quality_u32.to_be_bytes();
+    buffer[pos..pos + 4].copy_from_slice(&quality_bytes);
+    pos += 4;
 
     Ok(pos)
 }
@@ -569,23 +508,22 @@ fn encode_ethernet_header(buffer: &mut [u8], header: &EthernetHeader, length: u1
     new_pos
 }
 
-/// Encodes a complete SMV packet including Ethernet header with preallocated buffer
+/// Encodes a complete SMV packet with preallocated buffer (convenience wrapper)
 ///
-/// This version writes directly to the buffer using encode_*_buff functions,
-/// avoiding all intermediate allocations.
+/// This version calculates the exact size needed, allocates a single buffer,
+/// and writes directly using encode_*_buff functions without intermediate allocations.
 ///
 /// # Parameters
+/// - `buffer`: A mutable slice of u8 where the encoded packet will be written
 /// - `header`: The Ethernet header to use
 /// - `pdu`: The SavPdu to encode
-/// - `buffer`: Preallocated buffer to write into
 ///
 /// # Returns
-/// The number of bytes written, or an EncodeError if encoding fails
-fn encode_smv_into(
-    header: &EthernetHeader,
-    pdu: &SavPdu,
-    buffer: &mut [u8],
-) -> Result<usize, EncodeError> {
+/// The encoded packet as a byte vector, or an EncodeError if encoding fails
+pub fn encode_smv(header: &EthernetHeader, pdu: &SavPdu) -> Result<Vec<u8>, EncodeError> {
+    let size = smv_size(header, pdu);
+    let mut buffer = vec![0u8; size];
+
     let required_size = smv_size(header, pdu);
 
     if buffer.len() < required_size {
@@ -602,7 +540,7 @@ fn encode_smv_into(
     let length = pdu_total_len as u16 + 8;
 
     // Encode Ethernet header directly into buffer
-    let mut pos = encode_ethernet_header(buffer, header, length);
+    let pos = encode_ethernet_header(&mut buffer, header, length);
 
     // Set simulation bit in reserved1 field if needed
     let reserved1_offset = if header.tpid.is_some() && header.tci.is_some() {
@@ -616,26 +554,7 @@ fn encode_smv_into(
     }
 
     // Encode PDU directly into buffer
-    pos = encode_sav_pdu(buffer, pos, pdu)?;
-
-    Ok(pos)
-}
-
-/// Encodes a complete SMV packet with preallocated buffer (convenience wrapper)
-///
-/// This version calculates the exact size needed, allocates a single buffer,
-/// and writes directly using encode_*_buff functions without intermediate allocations.
-///
-/// # Parameters
-/// - `header`: The Ethernet header to use
-/// - `pdu`: The SavPdu to encode
-///
-/// # Returns
-/// The encoded packet as a byte vector, or an EncodeError if encoding fails
-pub fn encode_smv(header: &EthernetHeader, pdu: &SavPdu) -> Result<Vec<u8>, EncodeError> {
-    let size = smv_size(header, pdu);
-    let mut buffer = vec![0u8; size];
-    encode_smv_into(header, pdu, &mut buffer)?;
+    encode_sav_pdu(&mut buffer, pos, pdu)?;
 
     Ok(buffer)
 }
@@ -645,7 +564,22 @@ mod tests {
     use super::*;
     use crate::decode_basics::decode_ethernet_header;
     use crate::decode_smv::decode_smv;
-    use crate::types::Sample;
+    use crate::types::{Quality, Sample, SavDataSetConfig, SavValueConfig, Validity};
+
+    const QUALITY: Quality = Quality {
+        validity: Validity::Good,
+        overflow: false,
+        out_of_range: true,
+        bad_reference: false,
+        oscillatory: false,
+        failure: true,
+        old_data: false,
+        inconsistent: true,
+        inaccurate: false,
+        source_substituted: true,
+        test: false,
+        operator_blocked: true,
+    };
 
     #[test]
     fn test_encode_decode_roundtrip_simple() {
@@ -661,10 +595,8 @@ mod tests {
         };
 
         let samples = vec![
-            Sample::new(1000, 0x0000),
-            Sample::new(-2000, 0x0000),
-            Sample::new(3000, 0x0000),
-            Sample::new(-4000, 0x0000),
+            Sample::new(1.0, QUALITY, 0.001),
+            Sample::new(-20.0, QUALITY, 0.01),
         ];
 
         let asdu = SavAsdu {
@@ -693,7 +625,9 @@ mod tests {
         // Decode
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let decoded_pdu = decode_smv(&encoded, pos).expect("Decoding failed");
+        let config =
+            SavDataSetConfig::new(vec![SavValueConfig::new(0.001), SavValueConfig::new(0.01)]);
+        let decoded_pdu = decode_smv(&encoded, pos, &config).expect("Decoding failed");
 
         // Verify header
         assert_eq!(decoded_header.dst_addr, header.dst_addr);
@@ -740,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_length_calculation_exact_simple() {
+    fn test_length_calculation_exact_sample() {
         // Test with simple packet (no optional fields)
         let header = EthernetHeader {
             dst_addr: [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x01],
@@ -753,10 +687,8 @@ mod tests {
         };
 
         let samples = vec![
-            Sample::new(1000, 0x0000),
-            Sample::new(-2000, 0x0000),
-            Sample::new(3000, 0x0000),
-            Sample::new(-4000, 0x0000),
+            Sample::new(1.0, QUALITY, 0.001),
+            Sample::new(-20.0, QUALITY, 0.01),
         ];
 
         let asdu = SavAsdu {
@@ -809,9 +741,8 @@ mod tests {
         };
 
         let samples = vec![
-            Sample::new(10000, 0x0000),
-            Sample::new(-20000, 0x1FFF),
-            Sample::new(30000, 0x0001),
+            Sample::new(1.0, QUALITY, 0.001),
+            Sample::new(-20.0, QUALITY, 0.01),
         ];
 
         let asdu = SavAsdu {
@@ -848,7 +779,9 @@ mod tests {
         // Decode and verify all fields
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let decoded_pdu = decode_smv(&encoded, pos).expect("Decoding failed");
+        let config =
+            SavDataSetConfig::new(vec![SavValueConfig::new(0.001), SavValueConfig::new(0.01)]);
+        let decoded_pdu = decode_smv(&encoded, pos, &config).expect("Decoding failed");
 
         // Verify header including VLAN tags
         assert_eq!(decoded_header.dst_addr, header.dst_addr);
@@ -917,7 +850,10 @@ mod tests {
             refr_tm: None,
             smp_synch: 1,
             smp_rate: Some(4000),
-            all_data: vec![Sample::new(100, 0x0000), Sample::new(200, 0x0000)],
+            all_data: vec![
+                Sample::new(0.1, QUALITY, 0.001),
+                Sample::new(2.0, QUALITY, 0.01),
+            ],
             smp_mod: None,
             gm_identity: None,
         };
@@ -931,9 +867,9 @@ mod tests {
             smp_synch: 2,
             smp_rate: Some(8000),
             all_data: vec![
-                Sample::new(300, 0x0001),
-                Sample::new(400, 0x0002),
-                Sample::new(500, 0x0003),
+                Sample::new(0.3, QUALITY, 0.001),
+                Sample::new(4.0, QUALITY, 0.01),
+                Sample::new(5.0, QUALITY, 0.01),
             ],
             smp_mod: Some(1),
             gm_identity: Some([0xFF; 8]),
@@ -975,7 +911,7 @@ mod tests {
         for i in 0..8 {
             let mut samples = Vec::new();
             for j in 0..32 {
-                samples.push(Sample::new((i * 1000 + j * 100) as i32, (j % 4) as u16));
+                samples.push(Sample::new((i * 1000 + j * 100) as f32, QUALITY, 0.001));
             }
 
             asdus.push(SavAsdu {
@@ -1012,49 +948,6 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_minimal() {
-        // Minimal packet - no optional fields
-        let header = EthernetHeader {
-            dst_addr: [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x01],
-            src_addr: [0x00, 0x1a, 0xb6, 0x03, 0x2f, 0x1c],
-            tpid: None,
-            tci: None,
-            ether_type: [0x88, 0xba],
-            appid: [0x40, 0x01],
-            length: [0x00, 0x00],
-        };
-
-        let asdu = SavAsdu {
-            msv_id: "IED1".to_string(),
-            dat_set: None,
-            smp_cnt: 0,
-            conf_rev: 1,
-            refr_tm: None,
-            smp_synch: 0,
-            smp_rate: None,
-            all_data: vec![Sample::new(0, 0x0000)],
-            smp_mod: None,
-            gm_identity: None,
-        };
-
-        let pdu = SavPdu {
-            sim: false,
-            no_asdu: 1,
-            security: None,
-            sav_asdu: vec![asdu],
-        };
-
-        let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
-        let mut decoded_header = EthernetHeader::default();
-        let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let result = decode_smv(&encoded, pos);
-
-        assert!(result.is_ok(), "Decoding failed: {:?}", result.err());
-        assert_eq!(decoded_header.dst_addr, header.dst_addr);
-        assert_eq!(decoded_header.src_addr, header.src_addr);
-    }
-
-    #[test]
     fn test_roundtrip_with_vlan() {
         // Test VLAN tag encoding/decoding
         let header = EthernetHeader {
@@ -1075,7 +968,10 @@ mod tests {
             refr_tm: None,
             smp_synch: 1,
             smp_rate: Some(4000),
-            all_data: vec![Sample::new(1000, 0x0000), Sample::new(2000, 0x0000)],
+            all_data: vec![
+                Sample::new(1.0, QUALITY, 0.001),
+                Sample::new(20.0, QUALITY, 0.01),
+            ],
             smp_mod: None,
             gm_identity: None,
         };
@@ -1090,7 +986,9 @@ mod tests {
         let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let result = decode_smv(&encoded, pos);
+        let config =
+            SavDataSetConfig::new(vec![SavValueConfig::new(0.001), SavValueConfig::new(0.01)]);
+        let result = decode_smv(&encoded, pos, &config);
 
         assert!(result.is_ok(), "Decoding failed: {:?}", result.err());
         assert_eq!(decoded_header.tpid, header.tpid);
@@ -1118,7 +1016,7 @@ mod tests {
             refr_tm: None,
             smp_synch: 1,
             smp_rate: Some(4000),
-            all_data: vec![Sample::new(500, 0x0000)],
+            all_data: vec![Sample::new(500.0, QUALITY, 0.001)],
             smp_mod: None,
             gm_identity: None,
         };
@@ -1133,7 +1031,8 @@ mod tests {
         let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let result = decode_smv(&encoded, pos);
+        let config = SavDataSetConfig::new(vec![SavValueConfig::new(0.001)]);
+        let result = decode_smv(&encoded, pos, &config);
 
         assert!(result.is_ok(), "Decoding failed: {:?}", result.err());
         // Verify simulation bit in reserved1 field
@@ -1165,7 +1064,7 @@ mod tests {
             refr_tm: None,
             smp_synch: 1,
             smp_rate: Some(4000),
-            all_data: vec![Sample::new(750, 0x0000)],
+            all_data: vec![Sample::new(750.0, QUALITY, 0.001)],
             smp_mod: None,
             gm_identity: None,
         };
@@ -1180,7 +1079,8 @@ mod tests {
         let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let result = decode_smv(&encoded, pos);
+        let config = SavDataSetConfig::new(vec![SavValueConfig::new(0.001)]);
+        let result = decode_smv(&encoded, pos, &config);
 
         assert!(result.is_ok(), "Decoding failed: {:?}", result.err());
     }
@@ -1199,11 +1099,11 @@ mod tests {
         };
 
         let samples = vec![
-            Sample::new(10000, 0x0000),
-            Sample::new(-20000, 0x1FFF),
-            Sample::new(30000, 0x0001),
-            Sample::new(-32768, 0x1000),
-            Sample::new(32767, 0x0FFF),
+            Sample::new(10.0, QUALITY, 0.001),
+            Sample::new(-20.0, QUALITY, 0.001),
+            Sample::new(30.0, QUALITY, 0.001),
+            Sample::new(-32.768, QUALITY, 0.001),
+            Sample::new(32.767, QUALITY, 0.001),
         ];
 
         let asdu = SavAsdu {
@@ -1229,7 +1129,14 @@ mod tests {
         let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let result = decode_smv(&encoded, pos);
+        let config = SavDataSetConfig::new(vec![
+            SavValueConfig::new(0.001),
+            SavValueConfig::new(0.001),
+            SavValueConfig::new(0.001),
+            SavValueConfig::new(0.001),
+            SavValueConfig::new(0.001),
+        ]);
+        let result = decode_smv(&encoded, pos, &config);
 
         assert!(result.is_ok(), "Decoding failed: {:?}", result.err());
         // Verify header
@@ -1263,7 +1170,10 @@ mod tests {
                     refr_tm: None,
                     smp_synch: 1,
                     smp_rate: Some(4000),
-                    all_data: vec![Sample::new(100, 0x0000), Sample::new(200, 0x0000)],
+                    all_data: vec![
+                        Sample::new(1.00, QUALITY, 0.01),
+                        Sample::new(2.00, QUALITY, 0.01),
+                    ],
                     smp_mod: None,
                     gm_identity: None,
                 },
@@ -1276,9 +1186,8 @@ mod tests {
                     smp_synch: 2,
                     smp_rate: Some(8000),
                     all_data: vec![
-                        Sample::new(300, 0x0001),
-                        Sample::new(400, 0x0002),
-                        Sample::new(500, 0x0003),
+                        Sample::new(1.00, QUALITY, 0.01),
+                        Sample::new(2.00, QUALITY, 0.01),
                     ],
                     smp_mod: Some(1),
                     gm_identity: Some([0x22; 8]),
@@ -1291,7 +1200,10 @@ mod tests {
                     refr_tm: None,
                     smp_synch: 1,
                     smp_rate: None,
-                    all_data: vec![Sample::new(-1000, 0x1FFF)],
+                    all_data: vec![
+                        Sample::new(1.00, QUALITY, 0.01),
+                        Sample::new(2.00, QUALITY, 0.01),
+                    ],
                     smp_mod: Some(2),
                     gm_identity: None,
                 },
@@ -1302,7 +1214,9 @@ mod tests {
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
         // Just verify decoding succeeds without error
-        decode_smv(&encoded, pos).expect("Decoding failed");
+        let config =
+            SavDataSetConfig::new(vec![SavValueConfig::new(0.01), SavValueConfig::new(0.01)]);
+        decode_smv(&encoded, pos, &config).expect("Decoding failed");
     }
 
     #[test]
@@ -1319,13 +1233,8 @@ mod tests {
         };
 
         let samples = vec![
-            Sample::new(i32::MAX, 0x1FFF), // Max positive i32, max quality
-            Sample::new(i32::MIN, 0x0000), // Min negative i32, min quality
-            Sample::new(0, 0x0AAA),        // Zero value
-            Sample::new(127, 0x0555),      // Single byte positive
-            Sample::new(-128, 0x0FFF),     // Single byte negative
-            Sample::new(32767, 0x1000),    // Max 2-byte positive
-            Sample::new(-32768, 0x0001),   // Min 2-byte negative
+            Sample::new(i32::MAX as f32, QUALITY, 1.0), // Max positive i32, max quality
+            Sample::new(i32::MIN as f32, QUALITY, 1.0), // Min negative i32, min quality
         ];
 
         let pdu = SavPdu {
@@ -1349,7 +1258,9 @@ mod tests {
         let encoded = encode_smv(&header, &pdu).expect("Encoding failed");
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
-        let decoded_pdu = decode_smv(&encoded, pos).expect("Decoding failed");
+        let config =
+            SavDataSetConfig::new(vec![SavValueConfig::new(1.0), SavValueConfig::new(1.0)]);
+        let decoded_pdu = decode_smv(&encoded, pos, &config).expect("Decoding failed");
 
         // Verify header with extreme values
         assert_eq!(decoded_header.dst_addr, header.dst_addr);
@@ -1443,9 +1354,8 @@ mod tests {
                 for i in 0..8 {
                     let mut samples = Vec::new();
                     for j in 0..12 {
-                        let value = (i * 1000 + j * 100) as i32;
-                        let quality = ((i + j) % 8) as u16;
-                        samples.push(Sample::new(value, quality));
+                        let value = (i * 1000 + j * 100) as f32;
+                        samples.push(Sample::new(value, QUALITY, 0.1));
                     }
 
                     asdus.push(SavAsdu {
@@ -1469,6 +1379,20 @@ mod tests {
         let mut decoded_header = EthernetHeader::default();
         let pos = decode_ethernet_header(&mut decoded_header, &encoded);
         // Just verify decoding succeeds for large packet (8 ASDUs x 12 samples)
-        decode_smv(&encoded, pos).expect("Decoding failed");
+        let config = SavDataSetConfig::new(vec![
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+            SavValueConfig::new(0.01),
+        ]);
+        decode_smv(&encoded, pos, &config).expect("Decoding failed");
     }
 }

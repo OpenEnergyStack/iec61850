@@ -56,13 +56,14 @@ impl TimeQuality {
     }
 }
 
-/// Quality flags for IEC 61850 sampled values - 13 bits total
+/// Quality flags for IEC 61850 - 13 bits total, shared by GOOSE, Reports and MMS
+/// (see IEC 61850-7-2 Table 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Quality {
-    // Validity (2 bits) - bits 0-1
+    // Validity (2 bits)
     pub validity: Validity,
 
-    // Detail quality flags (8 bits) - bits 2-9
+    // Detail quality flags (8 bits)
     pub overflow: bool,
     pub out_of_range: bool,
     pub bad_reference: bool,
@@ -72,13 +73,10 @@ pub struct Quality {
     pub inconsistent: bool,
     pub inaccurate: bool,
 
-    // Source (1 bit) - bit 10
     pub source_substituted: bool,
 
-    // Test mode (1 bit) - bit 11
     pub test: bool,
 
-    // Operator blocked (1 bit) - bit 12
     pub operator_blocked: bool,
 }
 
@@ -92,11 +90,9 @@ pub enum Validity {
 }
 
 impl Quality {
-    /// Decodes quality from a 16-bit value (13 bits used)
-    /// The bitstring is transmitted MSB first in the encoding
     pub fn from_u16(value: u16) -> Self {
         Quality {
-            // Validity is bits 0-1 (most significant bits)
+            // Validity is bits 15-14 (most significant bits)
             validity: match (value >> 14) & 0x03 {
                 0 => Validity::Good,
                 1 => Validity::Invalid,
@@ -105,7 +101,7 @@ impl Quality {
                 _ => Validity::Good,
             },
 
-            // Detail quality flags (bits 2-9)
+            // Detail quality flags
             overflow: (value & (1 << 13)) != 0,
             out_of_range: (value & (1 << 12)) != 0,
             bad_reference: (value & (1 << 11)) != 0,
@@ -115,22 +111,22 @@ impl Quality {
             inconsistent: (value & (1 << 7)) != 0,
             inaccurate: (value & (1 << 6)) != 0,
 
-            // Source (bit 10)
+            // Source
             source_substituted: (value & (1 << 5)) != 0,
 
-            // Test (bit 11)
+            // Test
             test: (value & (1 << 4)) != 0,
 
-            // Operator blocked (bit 12)
+            // Operator blocked
             operator_blocked: (value & (1 << 3)) != 0,
         }
     }
 
-    /// Encodes quality to a 16-bit value
+    /// Encodes quality to a 16-bit value (see `from_u16`)
     pub fn to_u16(&self) -> u16 {
         let mut value = 0u16;
 
-        // Validity (bits 0-1)
+        // Validity (bits 15-14)
         value |= (self.validity as u16) << 14;
 
         // Detail quality flags
@@ -172,6 +168,83 @@ impl Quality {
         // Operator blocked
         if self.operator_blocked {
             value |= 1 << 3;
+        }
+
+        value
+    }
+
+    // Quality decoding acc. to IEC 61850-9-2
+    pub fn from_sv(quality_u32: u32) -> Self {
+        Quality {
+            // Validity bits 1-0 (bit number 31-30)
+            validity: match quality_u32 & 0x3 {
+                0 => Validity::Good,
+                1 => Validity::Invalid,
+                2 => Validity::Reserved,
+                3 => Validity::Questionable,
+                _ => Validity::Good,
+            },
+
+            // Detail quality flags (bit number 29-22)
+            overflow: (quality_u32 & (1 << 2)) != 0,
+            out_of_range: (quality_u32 & (1 << 3)) != 0,
+            bad_reference: (quality_u32 & (1 << 4)) != 0,
+            oscillatory: (quality_u32 & (1 << 5)) != 0,
+            failure: (quality_u32 & (1 << 6)) != 0,
+            old_data: (quality_u32 & (1 << 7)) != 0,
+            inconsistent: (quality_u32 & (1 << 8)) != 0,
+            inaccurate: (quality_u32 & (1 << 9)) != 0,
+
+            source_substituted: (quality_u32 & (1 << 10)) != 0,
+
+            test: (quality_u32 & (1 << 11)) != 0,
+
+            operator_blocked: (quality_u32 & (1 << 12)) != 0,
+        }
+    }
+
+    pub fn to_sv(&self) -> u32 {
+        let mut value = 0u32;
+
+        // Validity bits 1-0 (bit number 31-30)
+        value |= (self.validity as u32) & 0x3;
+
+        // Detail quality flags (bit number 29-22)
+        if self.overflow {
+            value |= 1 << 2;
+        }
+        if self.out_of_range {
+            value |= 1 << 3;
+        }
+        if self.bad_reference {
+            value |= 1 << 4;
+        }
+        if self.oscillatory {
+            value |= 1 << 5;
+        }
+        if self.failure {
+            value |= 1 << 6;
+        }
+        if self.old_data {
+            value |= 1 << 7;
+        }
+        if self.inconsistent {
+            value |= 1 << 8;
+        }
+        if self.inaccurate {
+            value |= 1 << 9;
+        }
+
+        if self.source_substituted {
+            value |= 1 << 10;
+        }
+
+        if self.test {
+            value |= 1 << 11;
+        }
+
+        if self.operator_blocked {
+            value |= 1 << 12;
         }
 
         value
@@ -1388,29 +1461,21 @@ impl From<&IECGoosePdu> for IECGoosePduRasn {
 /// A single sampled value with its quality
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    /// The integer value (before scaling)
-    pub value: i32,
     /// The quality flags
     pub quality: Quality,
+    /// voltage or current value
+    pub value: f32,
+    /// The scale factor for the value, e.g. 0.01 for voltage, 0.0001 for current
+    pub scale_factor: f32,
 }
 
 impl Sample {
-    /// Creates a new sample from raw value and quality bitstring (16-bit)
-    pub fn new(value: i32, quality_bits: u16) -> Self {
+    pub fn new(value: f32, quality: Quality, scale_factor: f32) -> Self {
         Sample {
+            quality,
             value,
-            quality: Quality::from_u16(quality_bits),
+            scale_factor,
         }
-    }
-
-    /// Creates a new sample from value and quality
-    pub fn from_parts(value: i32, quality: Quality) -> Self {
-        Sample { value, quality }
-    }
-
-    /// Scales the integer value by a factor
-    pub fn scaled_value(&self, scale: f32) -> f32 {
-        self.value as f32 * scale
     }
 }
 
@@ -1445,6 +1510,43 @@ pub struct SavPdu {
     pub security: Option<Vec<u8>>,
     /** All data send with the GOOSE */
     pub sav_asdu: Vec<SavAsdu>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SavDataSetConfig {
+    pub config: Vec<SavValueConfig>,
+}
+
+impl SavDataSetConfig {
+    pub fn new(config: Vec<SavValueConfig>) -> Self {
+        SavDataSetConfig { config }
+    }
+
+    pub fn le_92() -> Self {
+        SavDataSetConfig {
+            config: vec![
+                SavValueConfig::new(0.0001), // Phase A Current
+                SavValueConfig::new(0.0001), // Phase B Current
+                SavValueConfig::new(0.0001), // Phase C Current
+                SavValueConfig::new(0.0001), // Neutral Current
+                SavValueConfig::new(0.01),   // Phase A Voltage
+                SavValueConfig::new(0.01),   // Phase B Voltage
+                SavValueConfig::new(0.01),   // Phase C Voltage
+                SavValueConfig::new(0.01),   // Neutral Voltage
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SavValueConfig {
+    pub scale_factor: f32,
+}
+
+impl SavValueConfig {
+    pub fn new(scale_factor: f32) -> Self {
+        SavValueConfig { scale_factor }
+    }
 }
 
 #[derive(Debug)]
@@ -1672,6 +1774,94 @@ mod time_quality_tests {
         };
 
         assert_eq!(quality.accuracy_bits(), None);
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn test_quality_from_sv_good_all_zero() {
+        let quality = Quality::from_sv(0x00000000);
+        assert_eq!(quality.validity, Validity::Good);
+        assert!(!quality.overflow);
+        assert!(!quality.out_of_range);
+        assert!(!quality.bad_reference);
+        assert!(!quality.oscillatory);
+        assert!(!quality.failure);
+        assert!(!quality.old_data);
+        assert!(!quality.inconsistent);
+        assert!(!quality.inaccurate);
+        assert!(!quality.source_substituted);
+        assert!(!quality.test);
+        assert!(!quality.operator_blocked);
+        assert!(quality.is_good());
+    }
+
+    #[test]
+    fn test_quality_from_sv_invalid() {
+        let quality = Quality::from_sv(0x00000842);
+        assert_eq!(quality.validity, Validity::Reserved);
+        assert!(!quality.overflow);
+        assert!(!quality.out_of_range);
+        assert!(!quality.bad_reference);
+        assert!(!quality.oscillatory);
+        assert!(quality.failure);
+        assert!(!quality.old_data);
+        assert!(!quality.inconsistent);
+        assert!(!quality.inaccurate);
+        assert!(!quality.source_substituted);
+        assert!(quality.test);
+        assert!(!quality.operator_blocked);
+    }
+
+    #[test]
+    fn test_quality_from_u16_validity_bits() {
+        assert_eq!(Quality::from_sv(0x00000000).validity, Validity::Good);
+        assert_eq!(Quality::from_sv(0x00000001).validity, Validity::Invalid);
+        assert_eq!(Quality::from_sv(0x00000002).validity, Validity::Reserved);
+        assert_eq!(
+            Quality::from_sv(0x00000003).validity,
+            Validity::Questionable
+        );
+    }
+
+    #[test]
+    fn test_quality_from_sv_detail_and_flag_bits() {
+        assert!(Quality::from_sv(1 << 2).overflow);
+        assert!(Quality::from_sv(1 << 3).out_of_range);
+        assert!(Quality::from_sv(1 << 4).bad_reference);
+        assert!(Quality::from_sv(1 << 5).oscillatory);
+        assert!(Quality::from_sv(1 << 6).failure);
+        assert!(Quality::from_sv(1 << 7).old_data);
+        assert!(Quality::from_sv(1 << 8).inconsistent);
+        assert!(Quality::from_sv(1 << 9).inaccurate);
+        assert!(Quality::from_sv(1 << 10).source_substituted);
+        assert!(Quality::from_sv(1 << 11).test);
+        assert!(Quality::from_sv(1 << 12).operator_blocked);
+    }
+
+    #[test]
+    fn test_quality_to_sv_roundtrip() {
+        let quality = Quality {
+            validity: Validity::Invalid,
+            overflow: true,
+            out_of_range: true,
+            bad_reference: false,
+            oscillatory: false,
+            failure: false,
+            old_data: false,
+            inconsistent: false,
+            inaccurate: false,
+            source_substituted: false,
+            test: true,
+            operator_blocked: false,
+        };
+
+        let encoded = quality.to_sv();
+        let decoded = Quality::from_sv(encoded);
+        assert_eq!(quality, decoded);
     }
 }
 

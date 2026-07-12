@@ -1,4 +1,4 @@
-use crate::types::{DecodeError, SavAsdu, SavPdu};
+use crate::types::{DecodeError, Quality, Sample, SavAsdu, SavDataSetConfig, SavPdu};
 
 /// Decodes an octet string (raw bytes) from the buffer at the specified position and length.
 ///
@@ -288,17 +288,44 @@ fn decode_tag_length(
     Ok(pos)
 }
 
-/// Decodes a GOOSE PDU from the buffer at the specified position,
-/// writing the result into the provided mutable reference.
+/// Decodes a Sampled Values PDU from the buffer at the specified position.
+///
+/// The caller must supply a [`SavDataSetConfig`] that describes the data set
+/// structure, because the sampled-value payload is not self-describing.
 ///
 /// # Parameters
-/// - `pdu`: A mutable reference where the decoded IECGoosePdu will be stored.
-/// - `buffer`: The input byte slice containing the encoded GOOSE PDU.
+/// - `buffer`: The input byte slice containing the encoded SMV PDU.
 /// - `pos`: The starting position in the buffer to read from.
+/// - `config`: The data set configuration describing the structure of the sampled values.
 ///
 /// # Returns
-/// The new buffer position after decoding the PDU.
-pub fn decode_smv(buffer: &[u8], pos: usize) -> Result<SavPdu, DecodeError> {
+/// The decoded `SavPdu`.
+///
+/// # Data set configuration
+///
+/// For an IEC 61850-9-2LE packet with the fixed 8-channel data set, use the
+/// built-in configuration. It expects eight 4-byte integer + 4-byte quality
+/// samples with a scale factor of `0.001` for currents and `0.01` for voltages:
+///
+/// ```ignore
+/// let pdu = decode_smv(&buffer, pos, &SavDataSetConfig::le_92())?;
+/// ```
+///
+/// For a flexible data set, build a [`SavDataSetConfig`] with one
+/// [`SavValueConfig`] per member. Each member defines its own scale factor:
+///
+/// ```ignore
+/// let config = SavDataSetConfig::new(vec![
+///     SavValueConfig::new(0.001),
+///     SavValueConfig::new(0.001),
+/// ]);
+/// let pdu = decode_smv(&buffer, pos, &config)?;
+/// ```
+pub fn decode_smv(
+    buffer: &[u8],
+    pos: usize,
+    config: &SavDataSetConfig,
+) -> Result<SavPdu, DecodeError> {
     let mut pdu = SavPdu::default();
     let mut new_pos = pos;
 
@@ -331,7 +358,7 @@ pub fn decode_smv(buffer: &[u8], pos: usize) -> Result<SavPdu, DecodeError> {
     new_pos = decode_tag_length(&mut _tag, &mut length, buffer, new_pos)?;
 
     pdu.sav_asdu.clear();
-    decode_smv_asdus(&mut pdu.sav_asdu, buffer, new_pos, pdu.no_asdu)?;
+    decode_smv_asdus(&mut pdu.sav_asdu, buffer, new_pos, pdu.no_asdu, config)?;
 
     Ok(pdu)
 }
@@ -358,20 +385,26 @@ pub fn is_smv_frame(buffer: &[u8]) -> bool {
     ether_type == [0x88, 0xba]
 }
 
-/// Decodes a sequence of IECData elements from the buffer, returning a vector of decoded elements.
+/// Decodes a sequence of Sampled Values ASDUs from the buffer.
 ///
 /// # Parameters
-/// - `buffer`: The input byte slice containing the encoded IECData elements.
+/// - `val`: A mutable reference to the vector where decoded `SavAsdu` instances are appended.
+/// - `buffer`: The input byte slice containing the encoded ASDUs.
 /// - `start_pos`: The starting position in the buffer to read from.
-/// - `end_pos`: The position in the buffer where decoding should stop.
+/// - `no_asdu`: The number of ASDUs to decode.
+/// - `config`: The data set configuration describing the structure of the sampled values.
 ///
 /// # Returns
-/// A tuple with the vector of decoded IECData elements and the next position in the buffer.
+/// The new buffer position after decoding all ASDUs.
+///
+/// # Errors
+/// Returns `DecodeError` if the buffer is malformed or too short.
 fn decode_smv_asdus(
     val: &mut Vec<SavAsdu>,
     buffer: &[u8],
     start_pos: usize,
     no_asdu: u16,
+    config: &SavDataSetConfig,
 ) -> Result<usize, DecodeError> {
     let mut new_pos = start_pos;
 
@@ -382,7 +415,7 @@ fn decode_smv_asdus(
         // length field of the next ASDU
         new_pos = decode_tag_length(&mut _tag, &mut _length, buffer, new_pos)?;
 
-        let (next_pos, new_asdu) = decode_smv_asdu(buffer, new_pos)?;
+        let (next_pos, new_asdu) = decode_smv_asdu(buffer, new_pos, config)?;
         val.push(new_asdu);
         new_pos = next_pos;
     }
@@ -390,16 +423,24 @@ fn decode_smv_asdus(
     Ok(new_pos)
 }
 
-/// writing the result into the provided mutable reference.
+/// Decodes a single Sampled Values Application Service Data Unit (ASDU) from the buffer,
+/// writing the result into a newly created `SavAsdu`.
 ///
 /// # Parameters
-/// - `pdu`: A mutable reference where the decoded IECGoosePdu will be stored.
-/// - `buffer`: The input byte slice containing the encoded GOOSE PDU.
-/// - `pos`: The starting position in the buffer to read from.
+/// - `buffer`: The input byte slice containing the encoded ASDU.
+/// - `start_pos`: The starting position in the buffer to read from.
+/// - `config`: The data set configuration describing the structure of the sampled values.
 ///
 /// # Returns
-/// The new buffer position after decoding the PDU.
-fn decode_smv_asdu(buffer: &[u8], start_pos: usize) -> Result<(usize, SavAsdu), DecodeError> {
+/// A tuple containing the new buffer position and the decoded `SavAsdu`.
+///
+/// # Errors
+/// Returns `DecodeError` if the buffer is malformed or too short.
+fn decode_smv_asdu(
+    buffer: &[u8],
+    start_pos: usize,
+    config: &SavDataSetConfig,
+) -> Result<(usize, SavAsdu), DecodeError> {
     let mut asdu = SavAsdu::default();
 
     let mut new_pos = start_pos;
@@ -462,7 +503,7 @@ fn decode_smv_asdu(buffer: &[u8], start_pos: usize) -> Result<(usize, SavAsdu), 
     // Data Content
     new_pos = decode_tag_length(&mut _tag, &mut length, buffer, new_pos)?;
     asdu.all_data.clear();
-    let (next_pos, result) = decode_savs(buffer, new_pos, length)?;
+    let (next_pos, result) = decode_savs(buffer, new_pos, config)?;
     new_pos = next_pos;
     asdu.all_data = result;
 
@@ -516,261 +557,191 @@ fn decode_sim_bit(buffer: &[u8]) -> Option<bool> {
     Some((reserved1_byte & 0x80) != 0)
 }
 
+/// Decodes the sampled-value data set from the raw ASDU payload.
+///
+/// Each configured scaling factor is read as a sample - 4-byte big-endian signed integer (`i32`)
+/// followed by a 4-byte big-endian quality field (`u32`). The number of samples
+/// and the per-sample scale factor are taken from `data_set_config`.
+///
+/// # Arguments
+/// * `buffer` - The raw bytes of the ASDU data content.
+/// * `buffer_index` - The position in `buffer` where the data set starts.
+/// * `data_set_config` - Description of the data set: one entry per sample,
+///   each carrying the scale factor to apply to the raw integer value.
+///
+/// # Returns
+/// A tuple containing the new buffer position and the decoded `Sample`s.
+///
+/// # Errors
+/// Returns `DecodeError` if the buffer is too short for the configured data set.
 fn decode_savs(
     buffer: &[u8],
     buffer_index: usize,
-    data_length: usize,
-) -> Result<(usize, Vec<crate::types::Sample>), DecodeError> {
+    data_set_config: &SavDataSetConfig,
+) -> Result<(usize, Vec<Sample>), DecodeError> {
     let mut pos = buffer_index;
-    let end_pos = buffer_index + data_length;
-    let mut result = Vec::new();
 
-    let mut tag = 0u8;
-    let mut length = 0usize;
+    let mut samples = vec![];
 
-    while pos < end_pos {
-        // Decode the i32 value (ASN.1 BER encoded integer)
-        pos = decode_tag_length(&mut tag, &mut length, buffer, pos)?;
-
-        if tag != 0x83 {
+    for config in data_set_config.config.iter() {
+        if pos + 8 > buffer.len() {
             return Err(DecodeError::new(
-                &format!("Expected integer tag 0x83, got 0x{:02x}", tag),
+                "Buffer too short for sample value data set",
                 pos,
             ));
         }
 
-        // Decode the integer value using BER decompression
+        // Decode the integer value
         let mut value_bytes = [0u8; 4];
-        decompress_integer(&mut value_bytes, buffer, pos, length)?;
-        let int_val = i32::from_be_bytes(value_bytes);
-        pos += length;
+        value_bytes.copy_from_slice(&buffer[pos..pos + 4]);
+        let value = i32::from_be_bytes(value_bytes) as f32 * config.scale_factor;
+        pos += 4;
 
-        // Decode the quality bitstring (ASN.1 BER encoded bitstring)
-        pos = decode_tag_length(&mut tag, &mut length, buffer, pos)?;
+        let mut quality_bytes = [0u8; 4];
+        quality_bytes.copy_from_slice(&buffer[pos..pos + 4]);
+        let quality_32 = u32::from_be_bytes(quality_bytes);
+        let quality = Quality::from_sv(quality_32);
+        pos += 4;
 
-        if tag != 0x84 {
-            return Err(DecodeError::new(
-                &format!("Expected bitstring tag 0x84, got 0x{:02x}", tag),
-                pos,
-            ));
-        }
-
-        // First byte of bitstring is the number of unused bits
-        // For 13-bit quality, there should be 3 unused bits in the 2-byte encoding
-        if pos >= buffer.len() {
-            return Err(DecodeError::new(
-                "Buffer too short for bitstring unused bits",
-                pos,
-            ));
-        }
-        let _unused_bits = buffer[pos];
-        pos += 1;
-        let quality_length = length - 1; // Subtract the unused bits byte
-
-        // Read quality bytes (should be 2 bytes for 13-bit quality)
-        if pos + quality_length > buffer.len() {
-            return Err(DecodeError::new(
-                &format!("Buffer too short for quality bytes at pos {}", pos),
-                pos,
-            ));
-        }
-
-        // Quality is encoded as big-endian, read it as u16
-        // The unused bits are at the LSB end and already accounted for in the encoding
-        let mut quality_bits = 0u16;
-        for i in 0..quality_length {
-            quality_bits = (quality_bits << 8) | buffer[pos + i] as u16;
-        }
-        pos += quality_length;
-
-        result.push(crate::types::Sample::new(int_val, quality_bits));
+        samples.push(Sample::new(value, quality, config.scale_factor));
     }
 
-    Ok((pos, result))
+    Ok((pos, samples))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        decode_goose::decode_ethernet_header,
+        types::{EthernetHeader, SavValueConfig, Validity},
+    };
+
     use super::*;
-    use std::time::Instant;
 
-    fn create_test_data_buffer() -> Vec<u8> {
-        let mut buffer = Vec::new();
-
-        // 8 samples: each is ASN.1 BER encoded INT32 (tag 0x83) + BER encoded BITSTRING (tag 0x84)
-        for i in 0..8 {
-            let value = (10000 + i * 1000) as i32;
-            let value_bytes = value.to_be_bytes();
-
-            // Find the minimum number of bytes needed (BER compression)
-            let mut start_idx = 0;
-            for j in 0..3 {
-                if value >= 0 && value_bytes[j] == 0 && (value_bytes[j + 1] & 0x80) == 0 {
-                    start_idx = j + 1;
-                } else if value < 0 && value_bytes[j] == 0xFF && (value_bytes[j + 1] & 0x80) != 0 {
-                    start_idx = j + 1;
-                } else {
-                    break;
-                }
-            }
-            let compressed_bytes = &value_bytes[start_idx..];
-
-            // INT32 with tag 0x83
-            buffer.push(0x83);
-            buffer.push(compressed_bytes.len() as u8);
-            buffer.extend_from_slice(compressed_bytes);
-
-            // BITSTRING with tag 0x84 (13-bit quality in 2 bytes + 1 byte for unused bits)
-            // 13 bits requires 2 bytes, with 3 unused bits
-            let quality_13bit: u16 = 0x0000; // good quality (all zeros)
-            let quality_with_padding = quality_13bit << 3; // Shift left by 3 to add padding
-
-            buffer.push(0x84);
-            buffer.push(3); // length: 1 (unused bits) + 2 (quality bytes)
-            buffer.push(3); // 3 unused bits
-            buffer.extend_from_slice(&quality_with_padding.to_be_bytes());
-        }
-
-        buffer
+    fn buffer_92_le() -> Vec<u8> {
+        vec![
+            0x01, 0x0c, 0xcd, 0x04, 0x00, 0x00, 0xb4, 0xb1, 0x5a, 0x0e, 0x75, 0xb1, 0x88, 0xba,
+            0x40, 0x01, 0x00, 0x79, 0x00, 0x00, 0x00, 0x00, 0x60, 0x6f, 0x80, 0x01, 0x01, 0xa2,
+            0x6a, 0x30, 0x68, 0x80, 0x0d, 0x53, 0x49, 0x50, 0x41, 0x4d, 0x6f, 0x64, 0x33, 0x4d,
+            0x55, 0x31, 0x30, 0x33, 0x82, 0x02, 0x0c, 0xb3, 0x83, 0x04, 0x00, 0x00, 0x27, 0x11,
+            0x85, 0x01, 0x02, 0x87, 0x40, 0xff, 0xff, 0xfe, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xaa, 0x00, 0x00, 0x00,
+            0x00, 0xff, 0xff, 0xff, 0xc3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x23, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x23, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xd8,
+            0x7b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xfc, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x89,
+            0x08, 0xec, 0x46, 0x70, 0xff, 0xfe, 0x0a, 0xa5, 0x00,
+        ]
     }
+
+    fn flexible_data_set() -> Vec<u8> {
+        vec![
+            0x01, 0x0c, 0xcd, 0x04, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x88, 0xba,
+            0x40, 0x00, 0x00, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x60, 0x24, 0x80, 0x01, 0x01, 0xa2,
+            0x1f, 0x30, 0x1d, 0x80, 0x04, 0x30, 0x30, 0x30, 0x30, 0x82, 0x02, 0x02, 0x8d, 0x83,
+            0x04, 0x00, 0x00, 0x00, 0x01, 0x85, 0x01, 0x01, 0x87, 0x08, 0x00, 0x08, 0x46, 0x59,
+            0x00, 0x00, 0x15, 0x55,
+        ]
+    }
+
     #[test]
     fn test_decode_92_le_data_correctness() {
-        let buffer = create_test_data_buffer();
-        let result = decode_savs(&buffer, 0, buffer.len());
+        let packet = buffer_92_le();
+
+        let mut header = EthernetHeader::default();
+        let pos = decode_ethernet_header(&mut header, &packet);
+
+        assert!(header.dst_addr == [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x00]);
+        assert!(header.src_addr == [0xb4, 0xb1, 0x5a, 0x0e, 0x75, 0xb1]);
+        assert!(header.ether_type == [0x88, 0xba]);
+        assert!(header.tpid == None);
+        assert!(header.tci == None);
+
+        let result: Result<SavPdu, DecodeError> =
+            decode_smv(&packet, pos, &SavDataSetConfig::le_92());
 
         assert!(result.is_ok());
-        let (pos, data) = result.unwrap();
 
-        assert_eq!(pos, buffer.len());
-        assert_eq!(data.len(), 8);
+        let pdu = result.unwrap();
 
-        // Check first value (10000)
-        assert_eq!(data[0].value, 10000);
-        assert_eq!(data[0].quality.to_u16(), 0);
-        assert!(data[0].quality.is_good());
+        assert_eq!(pdu.sim, false);
+        assert!(pdu.no_asdu == 1);
+        assert!(pdu.security == None);
 
-        // Check last value (17000)
-        assert_eq!(data[7].value, 17000);
-        assert_eq!(data[7].quality.to_u16(), 0);
-        assert!(data[7].quality.is_good());
+        // Check ASDU
+        let asdu = &pdu.sav_asdu[0];
+        assert!(asdu.msv_id == "SIPAMod3MU103".to_string());
+        assert!(asdu.dat_set == None);
+        assert!(asdu.refr_tm == None);
+        assert_eq!(asdu.smp_cnt, 3251);
+        assert_eq!(asdu.conf_rev, 10001);
+        assert_eq!(asdu.smp_synch, 2);
+        assert_eq!(asdu.smp_rate, None);
+        assert_eq!(asdu.smp_mod, None);
+        assert_eq!(
+            asdu.gm_identity,
+            Some([0xec, 0x46, 0x70, 0xff, 0xfe, 0x0a, 0xa5, 0x00])
+        );
+
+        let data = &asdu.all_data;
+        assert!(data[0].value == -485.0 * data[0].scale_factor);
+        assert!(data[1].value == 488.0 * data[1].scale_factor);
+        assert!(data[2].value == -86.0 * data[2].scale_factor);
+        assert!(data[3].value == -61.0 * data[3].scale_factor);
+        assert!(data[4].value == 4387.0 * data[4].scale_factor);
+        assert!(data[5].value == 4643.0 * data[5].scale_factor);
+        assert!(data[6].value == -10117.0 * data[6].scale_factor);
+        assert!(data[7].value == -844.0 * data[7].scale_factor);
     }
 
     #[test]
-    fn test_decode_92_le_data_performance() {
-        let buffer = create_test_data_buffer();
-        let iterations = 100_000;
+    fn test_decode_flex_data_set_correctness() {
+        let packet = flexible_data_set();
 
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let _ = decode_savs(&buffer, 0, buffer.len());
-        }
-        let duration = start.elapsed();
+        let mut header = EthernetHeader::default();
+        let pos = decode_ethernet_header(&mut header, &packet);
 
-        let avg_ns = duration.as_nanos() / iterations;
-        let avg_us = avg_ns as f64 / 1000.0;
+        assert!(header.dst_addr == [0x01, 0x0c, 0xcd, 0x04, 0x00, 0x00]);
+        assert!(header.src_addr == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(header.ether_type == [0x88, 0xba]);
+        assert!(header.tpid == None);
+        assert!(header.tci == None);
 
-        println!("\n=== SMV Data Decode Performance ===");
-        println!("Iterations: {}", iterations);
-        println!("Total time: {:?}", duration);
-        println!("Average per decode: {} ns ({:.3} μs)", avg_ns, avg_us);
-        println!(
-            "Theoretical max rate: {:.0} Hz ({:.1} kHz)",
-            1_000_000.0 / avg_us,
-            (1_000_000.0 / avg_us) / 1000.0
-        );
+        let config = SavDataSetConfig::new(vec![SavValueConfig::new(0.001)]);
+        let result: Result<SavPdu, DecodeError> = decode_smv(&packet, pos, &config);
 
-        // Performance assertion: should decode in less than 10 microseconds
-        // (allowing headroom for 100 kHz = 10 μs between packets)
-        assert!(
-            avg_us < 10.0,
-            "Decode too slow: {:.3} μs (should be < 10 μs for 100 kHz rate)",
-            avg_us
-        );
-    }
-
-    #[test]
-    fn test_decode_variable_sample_count() {
-        // Test with 4 samples - using ASN.1 BER encoding
-        let mut buffer = Vec::new();
-        for i in 0..4 {
-            let value = (1000 + i * 100) as i32;
-            let value_bytes = value.to_be_bytes();
-
-            // Compress the integer (remove leading zeros for positive numbers)
-            let mut start_idx = 0;
-            for j in 0..3 {
-                if value_bytes[j] == 0 && (value_bytes[j + 1] & 0x80) == 0 {
-                    start_idx = j + 1;
-                } else {
-                    break;
-                }
-            }
-            let compressed = &value_bytes[start_idx..];
-
-            // INT32 with tag 0x83
-            buffer.push(0x83);
-            buffer.push(compressed.len() as u8);
-            buffer.extend_from_slice(compressed);
-
-            // BITSTRING with tag 0x84 (13-bit quality)
-            let quality_13bit: u16 = 0x0000;
-            let quality_with_padding = quality_13bit << 3;
-            buffer.push(0x84);
-            buffer.push(3); // 1 + 2 bytes
-            buffer.push(3); // 3 unused bits
-            buffer.extend_from_slice(&quality_with_padding.to_be_bytes());
-        }
-
-        let result = decode_savs(&buffer, 0, buffer.len());
         assert!(result.is_ok());
-        let (pos, data) = result.unwrap();
-        assert_eq!(data.len(), 4);
-        assert_eq!(pos, buffer.len());
-        assert_eq!(data[0].value, 1000);
-        assert_eq!(data[3].value, 1300);
 
-        // Test with 12 samples with quality flags (validity = invalid = 01)
-        let mut buffer = Vec::new();
-        for i in 0..12 {
-            let value = (2000 + i * 50) as i32;
-            let value_bytes = value.to_be_bytes();
+        let pdu = result.unwrap();
 
-            // Compress
-            let mut start_idx = 0;
-            for j in 0..3 {
-                if value_bytes[j] == 0 && (value_bytes[j + 1] & 0x80) == 0 {
-                    start_idx = j + 1;
-                } else {
-                    break;
-                }
-            }
-            let compressed = &value_bytes[start_idx..];
+        assert_eq!(pdu.sim, false);
+        assert!(pdu.no_asdu == 1);
+        assert!(pdu.security == None);
 
-            // INT32
-            buffer.push(0x83);
-            buffer.push(compressed.len() as u8);
-            buffer.extend_from_slice(compressed);
+        // Check ASDU
+        let asdu = &pdu.sav_asdu[0];
+        assert!(asdu.msv_id == "0000".to_string());
+        assert!(asdu.dat_set == None);
+        assert!(asdu.refr_tm == None);
+        assert_eq!(asdu.smp_cnt, 653);
+        assert_eq!(asdu.conf_rev, 1);
+        assert_eq!(asdu.smp_synch, 1);
+        assert_eq!(asdu.smp_rate, None);
+        assert_eq!(asdu.smp_mod, None);
 
-            // BITSTRING with quality = invalid (validity bits = 01 in the 13-bit value)
-            // The 13-bit quality occupies bits 15-3 of a 16-bit container (MSB aligned)
-            // Validity is bits 0-1 of the 13-bit value, which are bits 15-14 of the container
-            // 01 (invalid) = 0x4000 in the 16-bit container
-            let quality_16bit_container: u16 = 0x4000; // bit 14 set = validity invalid
-            buffer.push(0x84);
-            buffer.push(3);
-            buffer.push(3); // 3 unused bits at LSB end
-            buffer.extend_from_slice(&quality_16bit_container.to_be_bytes());
-        }
-
-        let result = decode_savs(&buffer, 0, buffer.len());
-        assert!(result.is_ok());
-        let (pos, data) = result.unwrap();
-        assert_eq!(data.len(), 12);
-        assert_eq!(pos, buffer.len());
-        assert_eq!(data[0].value, 2000);
-        assert_eq!(data[11].value, 2550);
-        // Check quality flag was decoded
-        assert_eq!(data[0].quality.validity, crate::types::Validity::Invalid);
+        let data = &asdu.all_data;
+        assert!(data[0].value == 542297.0 * data[0].scale_factor);
+        assert_eq!(data[0].quality.validity, Validity::Invalid);
+        assert_eq!(data[0].quality.overflow, true);
+        assert_eq!(data[0].quality.out_of_range, false);
+        assert_eq!(data[0].quality.bad_reference, true);
+        assert_eq!(data[0].quality.oscillatory, false);
+        assert_eq!(data[0].quality.failure, true);
+        assert_eq!(data[0].quality.old_data, false);
+        assert_eq!(data[0].quality.inconsistent, true);
+        assert_eq!(data[0].quality.inaccurate, false);
+        assert_eq!(data[0].quality.source_substituted, true);
+        assert_eq!(data[0].quality.test, false);
+        assert_eq!(data[0].quality.operator_blocked, true);
     }
 
     #[test]
