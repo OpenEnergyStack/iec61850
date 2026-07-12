@@ -2249,7 +2249,7 @@ mod tests {
     #[test]
     fn mms_data_to_iec_float_array_structure() {
         // 4-byte float for 3.0f
-        let fp4 = mms::FloatingPoint(OctetString::from(vec![0x40, 0x40, 0x00, 0x00]));
+        let fp4 = mms::FloatingPoint(OctetString::from(vec![0x08, 0x40, 0x40, 0x00, 0x00]));
         match mms_data_to_iec(&Data::floating_point(fp4)) {
             IECData::Float(v) => assert!((v - 3.0).abs() < 1e-6),
             other => panic!("expected float, got {:?}", other),
