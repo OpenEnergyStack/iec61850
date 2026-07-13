@@ -54,6 +54,9 @@ jobs:
     runs-on: ubuntu-latest
     # Only run benchmarks on PRs to main
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    permissions:
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -86,7 +89,7 @@ jobs:
         run: cargo bench --bench goose_codec -- --output-format bencher | tee goose_output.txt
 
       - name: Comment benchmark results
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
