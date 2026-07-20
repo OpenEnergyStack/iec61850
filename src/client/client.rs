@@ -1,5 +1,5 @@
 use crate::{
-    mms::MmsTransport,
+    client::{error::Error, mms::MmsTransport, types::DataReference, Protocol},
     types::{
         BufferedReportControlBlock, CancelObject, CancelResponse, ControlObject, ControlResponse,
         DataDefinition, IECData, Report, ReportType, SetBrcbValuesSettings, SetUrcbValuesSettings,
@@ -12,32 +12,8 @@ use async_trait::async_trait;
 use mms::client::TLSConfig;
 use std::time::Duration;
 
-#[derive(Debug)]
-pub enum Error {
-    ConnectionFailed(String),
-    DataAccessError(u8),
-    ParseError(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
-            Error::DataAccessError(code) => write!(f, "Data access error: {}", code),
-            Error::ParseError(msg) => write!(f, "Parse error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub enum Protocol {
-    Mms,
-    // Future: WebSocket, MQTT
-}
-
 #[async_trait]
-pub trait Transport: Send + Sync {
+pub(crate) trait Transport: Send + Sync {
     async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error>;
     async fn get_server_directory(&self) -> Result<Vec<String>, Error>;
     async fn get_logical_device_directory(&self, ld_name: String) -> Result<Vec<String>, Error>;
@@ -74,14 +50,6 @@ pub trait Transport: Send + Sync {
         &self,
         ctrl_obj_ref: String,
     ) -> mpsc::Receiver<Result<ControlResponse, Error>>;
-}
-
-// Function constraint data (FCD) or function constraint data attribute (FCDA)
-pub struct DataReference {
-    // Reference to a data point in the IEC 61850 model, e.g., "IED1/LLN0$ST$Val"
-    pub reference: String,
-    // Function constraint (e.g., "ST" for status, "MX" for measured value)
-    pub fc: String,
 }
 
 pub struct ClientBuilder {

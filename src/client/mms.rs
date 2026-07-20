@@ -1,4 +1,6 @@
-use crate::client::{DataReference, Error, Transport};
+use crate::client::client::Transport;
+use crate::client::error::Error;
+use crate::client::types::DataReference;
 use crate::types::{
     AddCause, AnalogueValue, BufferedReportControlBlock, CancelObject, CancelResponse, Check,
     ControlObject, ControlResponse, CtlVal, DataDefinition, DataType, EntryTime, IECData,
@@ -23,6 +25,7 @@ use mms::{
     VisibleString,
 };
 use std::time::Duration;
+use Error::ParseError;
 
 /// MMS error (field 2 in LastAppError) — only used for debug logging.
 #[derive(Debug, Clone, Copy)]
@@ -789,7 +792,7 @@ async fn control_write(
     ctrl_obj: ControlObject,
     data: Data,
     service: &str,
-) -> Result<ControlResponse, crate::client::Error> {
+) -> Result<ControlResponse, Error> {
     let ControlObject {
         ctrl_obj_ref,
         ctl_val,
@@ -812,7 +815,7 @@ async fn control_write(
     let write_results = client
         .write(variable, vec![data])
         .await
-        .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+        .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
     match write_results.into_iter().next() {
         Some(AnonymousWriteResponse::success(())) => {
@@ -829,11 +832,7 @@ async fn control_write(
             });
         }
         Some(AnonymousWriteResponse::failure(e)) => e.0,
-        None => {
-            return Err(crate::client::Error::ParseError(
-                "No write response received".into(),
-            ))
-        }
+        None => return Err(ParseError("No write response received".into())),
     };
 
     // Try to receive the LastAppError info report that should already be buffered.
@@ -973,22 +972,19 @@ fn parse_last_app_error(results: &rasn::types::SequenceOf<AccessResult>) -> Opti
 
 #[async_trait]
 impl Transport for MmsTransport {
-    async fn get_data_values(
-        &self,
-        refs: Vec<DataReference>,
-    ) -> Result<Vec<IECData>, crate::client::Error> {
+    async fn get_data_values(&self, refs: Vec<DataReference>) -> Result<Vec<IECData>, Error> {
         let variable: VariableAccessSpecification = parse_references(&refs)?;
 
         let results = self
             .client
             .read(variable)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         println!("MMS read results: {:?}", results);
 
         if results.len() != refs.len() {
-            return Err(crate::client::Error::ParseError(format!(
+            return Err(Error::ParseError(format!(
                 "Expected {} results, got {}",
                 refs.len(),
                 results.len()
@@ -1003,7 +999,7 @@ impl Transport for MmsTransport {
             match result {
                 AccessResult::success(data) => values.push(mms_data_to_iec(&data)),
                 AccessResult::failure(_code) => {
-                    return Err(crate::client::Error::ParseError(format!(
+                    return Err(Error::ParseError(format!(
                         "Access failed for reference index {}",
                         idx
                     )))
@@ -1014,7 +1010,7 @@ impl Transport for MmsTransport {
         Ok(values)
     }
 
-    async fn get_server_directory(&self) -> Result<Vec<String>, crate::client::Error> {
+    async fn get_server_directory(&self) -> Result<Vec<String>, Error> {
         let object_class = ObjectClass::basicObjectClass(9);
         let object_scope = GetNameListRequestObjectScope::vmdSpecific(());
 
@@ -1022,15 +1018,12 @@ impl Transport for MmsTransport {
             .client
             .get_name_list(object_class, object_scope)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         Ok(results.iter().map(|s| s.0.to_string()).collect())
     }
 
-    async fn get_logical_device_directory(
-        &self,
-        ld_name: String,
-    ) -> Result<Vec<String>, crate::client::Error> {
+    async fn get_logical_device_directory(&self, ld_name: String) -> Result<Vec<String>, Error> {
         let object_class = ObjectClass::basicObjectClass(0);
         let object_scope = GetNameListRequestObjectScope::domainSpecific(Identifier(
             VisibleString::try_from(ld_name).unwrap_or_default(),
@@ -1040,15 +1033,12 @@ impl Transport for MmsTransport {
             .client
             .get_name_list(object_class, object_scope)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         Ok(results.iter().map(|s| s.0.to_string()).collect())
     }
 
-    async fn get_data_definition(
-        &self,
-        data_ref: DataReference,
-    ) -> Result<DataDefinition, crate::client::Error> {
+    async fn get_data_definition(&self, data_ref: DataReference) -> Result<DataDefinition, Error> {
         let fc = &data_ref.fc;
         // Extract the leaf name from the reference, e.g. "IED1/XCBR1.Pos" -> "Pos"
         let name = data_ref
@@ -1074,7 +1064,7 @@ impl Transport for MmsTransport {
             .client
             .get_variable_access_attributes(request)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         Ok(type_description_to_data_definition(
             name,
@@ -1086,7 +1076,7 @@ impl Transport for MmsTransport {
         &self,
         brcb_ref: String,
         settings: SetBrcbValuesSettings,
-    ) -> Result<Vec<Result<(), crate::client::Error>>, crate::client::Error> {
+    ) -> Result<Vec<Result<(), Error>>, Error> {
         let mut refs: Vec<DataReference> = Vec::new();
         let mut values: Vec<IECData> = Vec::new();
 
@@ -1137,14 +1127,11 @@ impl Transport for MmsTransport {
         }
 
         if refs.is_empty() {
-            return Err(crate::client::Error::ParseError(
-                "No BRCB settings provided".into(),
-            ));
+            return Err(Error::ParseError("No BRCB settings provided".into()));
         }
 
         let variable: VariableAccessSpecification = parse_references(&refs)?;
-        let data: Result<Vec<Data>, crate::client::Error> =
-            values.iter().map(iec_data_to_mms).collect();
+        let data: Result<Vec<Data>, Error> = values.iter().map(iec_data_to_mms).collect();
         let data = data?;
 
         println!("set_brcb_values variable: {:#?}", variable);
@@ -1154,17 +1141,15 @@ impl Transport for MmsTransport {
             .client
             .write(variable, data)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         println!("set_brcb_values result: {:#?}", write_results);
 
-        let results: Vec<Result<(), crate::client::Error>> = write_results
+        let results: Vec<Result<(), Error>> = write_results
             .into_iter()
             .map(|r| match r {
                 AnonymousWriteResponse::success(()) => Ok(()),
-                AnonymousWriteResponse::failure(e) => {
-                    Err(crate::client::Error::DataAccessError(e.0))
-                }
+                AnonymousWriteResponse::failure(e) => Err(Error::DataAccessError(e.0)),
             })
             .collect();
 
@@ -1175,7 +1160,7 @@ impl Transport for MmsTransport {
         &self,
         urcb_ref: String,
         settings: SetUrcbValuesSettings,
-    ) -> Result<Vec<Result<(), crate::client::Error>>, crate::client::Error> {
+    ) -> Result<Vec<Result<(), Error>>, Error> {
         let mut refs: Vec<DataReference> = Vec::new();
         let mut values: Vec<IECData> = Vec::new();
 
@@ -1219,38 +1204,30 @@ impl Transport for MmsTransport {
         }
 
         if refs.is_empty() {
-            return Err(crate::client::Error::ParseError(
-                "No URCB settings provided".into(),
-            ));
+            return Err(Error::ParseError("No URCB settings provided".into()));
         }
 
         let variable: VariableAccessSpecification = parse_references(&refs)?;
-        let data: Result<Vec<Data>, crate::client::Error> =
-            values.iter().map(iec_data_to_mms).collect();
+        let data: Result<Vec<Data>, Error> = values.iter().map(iec_data_to_mms).collect();
         let data = data?;
 
         let write_results = self
             .client
             .write(variable, data)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
-        let results: Vec<Result<(), crate::client::Error>> = write_results
+        let results: Vec<Result<(), Error>> = write_results
             .into_iter()
             .map(|r| match r {
                 AnonymousWriteResponse::success(()) => Ok(()),
-                AnonymousWriteResponse::failure(e) => {
-                    Err(crate::client::Error::DataAccessError(e.0))
-                }
+                AnonymousWriteResponse::failure(e) => Err(Error::DataAccessError(e.0)),
             })
             .collect();
 
         Ok(results)
     }
-    async fn get_brcb_values(
-        &self,
-        brcb_ref: String,
-    ) -> Result<BufferedReportControlBlock, crate::client::Error> {
+    async fn get_brcb_values(&self, brcb_ref: String) -> Result<BufferedReportControlBlock, Error> {
         let refs = vec![DataReference {
             reference: brcb_ref,
             fc: "BR".to_string(),
@@ -1261,78 +1238,62 @@ impl Transport for MmsTransport {
             .client
             .read(variable)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         let fields = match results.into_iter().next() {
             Some(AccessResult::success(data)) => match data {
                 Data::structure(s) => s,
                 _ => {
-                    return Err(crate::client::Error::ParseError(
+                    return Err(Error::ParseError(
                         "Expected structure response for BRCB".into(),
                     ))
                 }
             },
-            Some(AccessResult::failure(e)) => {
-                return Err(crate::client::Error::DataAccessError(e.0))
-            }
-            None => {
-                return Err(crate::client::Error::ParseError(
-                    "Empty response for BRCB read".into(),
-                ))
-            }
+            Some(AccessResult::failure(e)) => return Err(Error::DataAccessError(e.0)),
+            None => return Err(Error::ParseError("Empty response for BRCB read".into())),
         };
 
         if fields.len() < 14 {
-            return Err(crate::client::Error::ParseError(format!(
+            return Err(Error::ParseError(format!(
                 "Expected 14 or 15 structure fields, got {}",
                 fields.len()
             )));
         }
 
-        fn as_string(data: &Data, name: &'static str) -> Result<String, crate::client::Error> {
+        fn as_string(data: &Data, name: &'static str) -> Result<String, Error> {
             match data {
                 Data::visible_string(s) => Ok(s.to_string()),
                 Data::mMSString(s) => Ok(s.0.to_string()),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected string"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected string"))),
             }
         }
-        fn as_bool(data: &Data, name: &'static str) -> Result<bool, crate::client::Error> {
+        fn as_bool(data: &Data, name: &'static str) -> Result<bool, Error> {
             match data {
                 Data::boolean(b) => Ok(*b),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected bool"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected bool"))),
             }
         }
-        fn as_u32(data: &Data, name: &'static str) -> Result<u32, crate::client::Error> {
+        fn as_u32(data: &Data, name: &'static str) -> Result<u32, Error> {
             match data {
                 Data::unsigned(u) => Ok(u64::try_from(u).unwrap_or(0) as u32),
                 Data::integer(i) => Ok(i64::try_from(i).unwrap_or(0) as u32),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected uint"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected uint"))),
             }
         }
-        fn as_i16(data: &Data, name: &'static str) -> Result<i16, crate::client::Error> {
+        fn as_i16(data: &Data, name: &'static str) -> Result<i16, Error> {
             match data {
                 Data::integer(i) => Ok(i64::try_from(i).unwrap_or(0) as i16),
                 Data::unsigned(u) => Ok(u64::try_from(u).unwrap_or(0) as i16),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected int16"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected int16"))),
             }
         }
-        fn as_bytes(data: &Data, name: &'static str) -> Result<Vec<u8>, crate::client::Error> {
+        fn as_bytes(data: &Data, name: &'static str) -> Result<Vec<u8>, Error> {
             match data {
                 Data::octet_string(octets) => Ok(octets.as_ref().to_vec()),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected octet string"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected octet string"))),
             }
         }
-        fn as_opt_flds(data: &Data) -> Result<ReportOptFields, crate::client::Error> {
+        fn as_opt_flds(data: &Data) -> Result<ReportOptFields, Error> {
             match data {
                 Data::bit_string(bits) => {
                     let s: String = bits
@@ -1346,12 +1307,10 @@ impl Transport for MmsTransport {
                         .collect();
                     Ok(ReportOptFields::from_bit_string(&s))
                 }
-                _ => Err(crate::client::Error::ParseError(
-                    "OptFlds: expected bit string".into(),
-                )),
+                _ => Err(Error::ParseError("OptFlds: expected bit string".into())),
             }
         }
-        fn as_trg_ops(data: &Data) -> Result<TriggerOptions, crate::client::Error> {
+        fn as_trg_ops(data: &Data) -> Result<TriggerOptions, Error> {
             match data {
                 Data::bit_string(bits) => {
                     let s: String = bits
@@ -1365,9 +1324,7 @@ impl Transport for MmsTransport {
                         .collect();
                     Ok(TriggerOptions::from_bit_string(&s))
                 }
-                _ => Err(crate::client::Error::ParseError(
-                    "TrgOps: expected bit string".into(),
-                )),
+                _ => Err(Error::ParseError("TrgOps: expected bit string".into())),
             }
         }
 
@@ -1387,7 +1344,7 @@ impl Transport for MmsTransport {
             time_of_entry: match &fields[12] {
                 Data::binary_time(t) => EntryTime(t.0.as_ref().to_vec()),
                 other => {
-                    return Err(crate::client::Error::ParseError(format!(
+                    return Err(Error::ParseError(format!(
                         "TimeOfEntry: expected binary_time, got: {other:#?}"
                     )))
                 }
@@ -1404,7 +1361,7 @@ impl Transport for MmsTransport {
     async fn get_urcb_values(
         &self,
         urcb_ref: String,
-    ) -> Result<UnbufferedReportControlBlock, crate::client::Error> {
+    ) -> Result<UnbufferedReportControlBlock, Error> {
         let refs = vec![DataReference {
             reference: urcb_ref,
             fc: "RP".to_string(),
@@ -1415,25 +1372,19 @@ impl Transport for MmsTransport {
             .client
             .read(variable)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         let fields = match results.into_iter().next() {
             Some(AccessResult::success(data)) => match data {
                 Data::structure(s) => s,
                 _ => {
-                    return Err(crate::client::Error::ParseError(
+                    return Err(Error::ParseError(
                         "Expected structure response for URCB".into(),
                     ))
                 }
             },
-            Some(AccessResult::failure(e)) => {
-                return Err(crate::client::Error::DataAccessError(e.0))
-            }
-            None => {
-                return Err(crate::client::Error::ParseError(
-                    "Empty response for URCB read".into(),
-                ))
-            }
+            Some(AccessResult::failure(e)) => return Err(Error::DataAccessError(e.0)),
+            None => return Err(Error::ParseError("Empty response for URCB read".into())),
         };
 
         // URCB has 11 mandatory fields + optional Owner = 11 or 12
@@ -1441,49 +1392,39 @@ impl Transport for MmsTransport {
             for (i, f) in fields.iter().enumerate() {
                 println!("  [{i}]: {f:#?}");
             }
-            return Err(crate::client::Error::ParseError(format!(
+            return Err(Error::ParseError(format!(
                 "Expected 11 or 12 structure fields for URCB, got {}",
                 fields.len()
             )));
         }
 
-        fn as_string(data: &Data, name: &'static str) -> Result<String, crate::client::Error> {
+        fn as_string(data: &Data, name: &'static str) -> Result<String, Error> {
             match data {
                 Data::visible_string(s) => Ok(s.to_string()),
                 Data::mMSString(s) => Ok(s.0.to_string()),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected string"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected string"))),
             }
         }
-        fn as_bool(data: &Data, name: &'static str) -> Result<bool, crate::client::Error> {
+        fn as_bool(data: &Data, name: &'static str) -> Result<bool, Error> {
             match data {
                 Data::boolean(b) => Ok(*b),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected bool"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected bool"))),
             }
         }
-        fn as_u32(data: &Data, name: &'static str) -> Result<u32, crate::client::Error> {
+        fn as_u32(data: &Data, name: &'static str) -> Result<u32, Error> {
             match data {
                 Data::unsigned(u) => Ok(u64::try_from(u).unwrap_or(0) as u32),
                 Data::integer(i) => Ok(i64::try_from(i).unwrap_or(0) as u32),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected uint"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected uint"))),
             }
         }
-        fn as_bytes(data: &Data, name: &'static str) -> Result<Vec<u8>, crate::client::Error> {
+        fn as_bytes(data: &Data, name: &'static str) -> Result<Vec<u8>, Error> {
             match data {
                 Data::octet_string(octets) => Ok(octets.as_ref().to_vec()),
-                _ => Err(crate::client::Error::ParseError(format!(
-                    "{name}: expected octet string"
-                ))),
+                _ => Err(Error::ParseError(format!("{name}: expected octet string"))),
             }
         }
-        fn as_urcb_opt_flds(
-            data: &Data,
-        ) -> Result<UnbufferedReportOptFields, crate::client::Error> {
+        fn as_urcb_opt_flds(data: &Data) -> Result<UnbufferedReportOptFields, Error> {
             match data {
                 Data::bit_string(bits) => {
                     let s: String = bits
@@ -1497,12 +1438,10 @@ impl Transport for MmsTransport {
                         .collect();
                     Ok(UnbufferedReportOptFields::from_bit_string(&s))
                 }
-                _ => Err(crate::client::Error::ParseError(
-                    "OptFlds: expected bit string".into(),
-                )),
+                _ => Err(Error::ParseError("OptFlds: expected bit string".into())),
             }
         }
-        fn as_trg_ops(data: &Data) -> Result<TriggerOptions, crate::client::Error> {
+        fn as_trg_ops(data: &Data) -> Result<TriggerOptions, Error> {
             match data {
                 Data::bit_string(bits) => {
                     let s: String = bits
@@ -1516,9 +1455,7 @@ impl Transport for MmsTransport {
                         .collect();
                     Ok(TriggerOptions::from_bit_string(&s))
                 }
-                _ => Err(crate::client::Error::ParseError(
-                    "TrgOps: expected bit string".into(),
-                )),
+                _ => Err(Error::ParseError("TrgOps: expected bit string".into())),
             }
         }
 
@@ -1801,7 +1738,7 @@ impl Transport for MmsTransport {
         rx
     }
 
-    async fn select(&self, ctrl_obj_ref: String) -> Result<(), crate::client::Error> {
+    async fn select(&self, ctrl_obj_ref: String) -> Result<(), Error> {
         let refs = parse_references(&[DataReference {
             reference: format!("{}.SBO", ctrl_obj_ref),
             fc: "CO".to_string(),
@@ -1810,33 +1747,25 @@ impl Transport for MmsTransport {
             .client
             .read(refs)
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
         match results.into_iter().next() {
             Some(AccessResult::success(_)) => Ok(()),
-            Some(AccessResult::failure(e)) => Err(crate::client::Error::DataAccessError(e.0)),
-            None => Err(crate::client::Error::ParseError(
-                "select: empty response".into(),
-            )),
+            Some(AccessResult::failure(e)) => Err(Error::DataAccessError(e.0)),
+            None => Err(Error::ParseError("select: empty response".into())),
         }
     }
 
-    async fn operate(
-        &self,
-        ctrl_obj: ControlObject,
-    ) -> Result<ControlResponse, crate::client::Error> {
+    async fn operate(&self, ctrl_obj: ControlObject) -> Result<ControlResponse, Error> {
         let data = control_object_to_data(&ctrl_obj);
         control_write(&self.client, ctrl_obj, data, "Oper").await
     }
 
-    async fn select_with_value(
-        &self,
-        ctrl_obj: ControlObject,
-    ) -> Result<ControlResponse, crate::client::Error> {
+    async fn select_with_value(&self, ctrl_obj: ControlObject) -> Result<ControlResponse, Error> {
         let data = control_object_to_data(&ctrl_obj);
         control_write(&self.client, ctrl_obj, data, "SBOw").await
     }
 
-    async fn cancel(&self, ctrl_obj: CancelObject) -> Result<CancelResponse, crate::client::Error> {
+    async fn cancel(&self, ctrl_obj: CancelObject) -> Result<CancelResponse, Error> {
         let data = cancel_object_to_data(&ctrl_obj);
         let ctrl_obj_ref = ctrl_obj.ctrl_obj_ref;
         let reference = DataReference {
@@ -1851,7 +1780,7 @@ impl Transport for MmsTransport {
             .client
             .write(variable, vec![data])
             .await
-            .map_err(|e| crate::client::Error::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
 
         match write_results.into_iter().next() {
             Some(AnonymousWriteResponse::success(())) => {
@@ -1867,11 +1796,7 @@ impl Transport for MmsTransport {
                 });
             }
             Some(AnonymousWriteResponse::failure(e)) => e.0,
-            None => {
-                return Err(crate::client::Error::ParseError(
-                    "No write response received".into(),
-                ))
-            }
+            None => return Err(Error::ParseError("No write response received".into())),
         };
 
         let last_app_error = subscribe_last_appl_error(&mut bcast).await;
@@ -1896,7 +1821,7 @@ impl Transport for MmsTransport {
     fn subscribe_command_termination(
         &self,
         ctrl_obj_ref: String,
-    ) -> tokio::sync::mpsc::Receiver<Result<ControlResponse, crate::client::Error>> {
+    ) -> tokio::sync::mpsc::Receiver<Result<ControlResponse, Error>> {
         use mms::messages::iso_9506_mms_1::UnconfirmedService;
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1980,7 +1905,7 @@ impl Transport for MmsTransport {
                     }
                 }) else {
                     if tx
-                        .send(Err(crate::client::Error::ParseError(
+                        .send(Err(Error::ParseError(
                             "CommandTermination: no Oper structure in access results".into(),
                         )))
                         .await
@@ -1994,7 +1919,7 @@ impl Transport for MmsTransport {
                 // Parse the Oper structure fields: ctlVal, origin, ctlNum, T, Test, Check.
                 if fields.len() < 6 {
                     if tx
-                        .send(Err(crate::client::Error::ParseError(format!(
+                        .send(Err(Error::ParseError(format!(
                             "CommandTermination: Oper structure has {} fields, expected >=6",
                             fields.len()
                         ))))
@@ -2042,7 +1967,7 @@ impl Transport for MmsTransport {
                     }
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected ctlVal data type".into(),
                             )))
                             .await
@@ -2072,7 +1997,7 @@ impl Transport for MmsTransport {
                     }
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected origin data type".into(),
                             )))
                             .await
@@ -2088,7 +2013,7 @@ impl Transport for MmsTransport {
                     Data::integer(i) => i64::try_from(i).unwrap_or(0) as u8,
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected ctlNum data type".into(),
                             )))
                             .await
@@ -2103,7 +2028,7 @@ impl Transport for MmsTransport {
                     Data::utc_time(ut) => utc_time_to_timestamp(ut),
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected T (timestamp) data type".into(),
                             )))
                             .await
@@ -2118,7 +2043,7 @@ impl Transport for MmsTransport {
                     Data::boolean(b) => *b,
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected Test data type".into(),
                             )))
                             .await
@@ -2140,7 +2065,7 @@ impl Transport for MmsTransport {
                     }
                     _ => {
                         if tx
-                            .send(Err(crate::client::Error::ParseError(
+                            .send(Err(Error::ParseError(
                                 "CommandTermination: unexpected Check data type".into(),
                             )))
                             .await
@@ -2189,7 +2114,7 @@ impl Transport for MmsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::DataReference;
+    use crate::client::types::DataReference;
     use rasn::types::{OctetString, SequenceOf};
 
     fn unwrap_item_id(spec: &VariableAccessSpecification) -> String {

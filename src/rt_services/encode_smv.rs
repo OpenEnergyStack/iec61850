@@ -521,6 +521,7 @@ fn encode_ethernet_header(buffer: &mut [u8], header: &EthernetHeader, length: u1
 ///
 /// # Returns
 /// The encoded packet as a byte vector, or an EncodeError if encoding fails
+#[allow(dead_code)]
 pub fn encode_smv(header: &EthernetHeader, pdu: &SavPdu) -> Result<Vec<u8>, EncodeError> {
     let size = smv_size(header, pdu);
     let mut buffer = vec![0u8; size];
@@ -562,10 +563,17 @@ pub fn encode_smv(header: &EthernetHeader, pdu: &SavPdu) -> Result<Vec<u8>, Enco
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::decode_basics::decode_ethernet_header;
-    use crate::decode_smv::decode_smv;
-    use crate::types::{Quality, Sample, SavDataSetConfig, SavValueConfig, Validity};
+    use crate::{
+        rt_services::{
+            decode_smv::decode_smv,
+            encode_smv::{encode_smv, smv_size},
+            ethernet_header::decode_ethernet_header,
+        },
+        types::{
+            EthernetHeader, Quality, Sample, SavAsdu, SavDataSetConfig, SavPdu, SavValueConfig,
+            Validity,
+        },
+    };
 
     const QUALITY: Quality = Quality {
         validity: Validity::Good,

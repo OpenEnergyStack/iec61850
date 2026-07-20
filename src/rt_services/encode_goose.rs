@@ -1,6 +1,6 @@
 use rasn::ber::encode;
 
-use crate::types::*;
+use crate::{rt_services::types::IECGoosePduRasn, types::*};
 
 pub fn encode_ethernet_header(header: &EthernetHeader, length: u16) -> Vec<u8> {
     // init buffer

@@ -1,8 +1,8 @@
-use crate::types::{DecodeError, IECGoosePdu, IECGoosePduRasn};
+use crate::{
+    rt_services::types::IECGoosePduRasn,
+    types::{DecodeError, IECGoosePdu},
+};
 use rasn::ber::decode;
-
-// Re-export decode_ethernet_header for backward compatibility
-pub use crate::decode_basics::decode_ethernet_header;
 
 /// Decodes a GOOSE PDU from the buffer using rasn.
 /// Returns the decoded PDU.
@@ -45,7 +45,10 @@ pub fn is_goose_frame(buffer: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EthernetHeader, IECData};
+    use crate::{
+        rt_services::{encode_goose::encode_goose, ethernet_header::decode_ethernet_header},
+        types::{EthernetHeader, IECData},
+    };
 
     #[test]
     fn test_decode_goose_pdu_all_fields() {
@@ -188,7 +191,6 @@ mod tests {
 
     #[test]
     fn test_goose_encode_performance() {
-        use crate::encode_goose::encode_goose;
         use crate::types::{EthernetHeader, IECData, IECGoosePdu, TimeQuality, Timestamp};
         use std::time::Instant;
 
@@ -264,7 +266,6 @@ mod tests {
 
     #[test]
     fn test_goose_roundtrip_performance() {
-        use crate::encode_goose::encode_goose;
         use crate::types::{EthernetHeader, IECData, IECGoosePdu, TimeQuality, Timestamp};
         use std::time::Instant;
 

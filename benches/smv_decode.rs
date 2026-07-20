@@ -1,8 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use iec_61850::decode_smv::decode_smv;
-use iec_61850::encode_smv::encode_smv;
-use iec_61850::types::{
-    EthernetHeader, Quality, Sample, SavAsdu, SavDataSetConfig, SavPdu, SavValueConfig, Validity,
+use iec_61850::{
+    decode_smv, encode_smv,
+    types::{
+        EthernetHeader, Quality, Sample, SavAsdu, SavDataSetConfig, SavPdu, SavValueConfig,
+        Validity,
+    },
 };
 
 /// Diagnostic function to validate packet structure

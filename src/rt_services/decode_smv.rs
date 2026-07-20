@@ -612,7 +612,7 @@ fn decode_savs(
 #[cfg(test)]
 mod tests {
     use crate::{
-        decode_goose::decode_ethernet_header,
+        rt_services::ethernet_header::decode_ethernet_header,
         types::{EthernetHeader, SavValueConfig, Validity},
     };
 

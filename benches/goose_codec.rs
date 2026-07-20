@@ -1,8 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use iec_61850::decode_basics::decode_ethernet_header;
-use iec_61850::decode_goose::{decode_goose_pdu, is_goose_frame};
-use iec_61850::encode_goose::{encode_ethernet_header, encode_goose};
-use iec_61850::types::{EthernetHeader, IECData, IECGoosePdu, TimeQuality, Timestamp};
+use iec_61850::{
+    decode_ethernet_header, decode_goose_pdu, encode_ethernet_header, encode_goose, is_goose_frame,
+    types::{EthernetHeader, IECData, IECGoosePdu, TimeQuality, Timestamp},
+};
 
 /// Create sample GOOSE PDU for encoding with realistic data size
 /// Typical GOOSE frames contain 50-200 data points
