@@ -2,14 +2,18 @@ pub mod control;
 pub mod enumerations;
 pub mod report;
 pub mod rt_services;
-pub mod types;
+
+// The file is still physically named `types/types.rs` for now, but we expose
+// it as `common` to avoid `clippy::module_inception` (`types::types`).
+#[path = "types/types.rs"]
+pub mod common;
 
 // Re-export items from submodules so `crate::types::*` keeps working.
+pub use common::*;
 pub use control::*;
 pub use enumerations::*;
 pub use report::*;
 pub use rt_services::*;
-pub use types::*;
 
 use core::str;
 

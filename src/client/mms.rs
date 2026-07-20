@@ -1,4 +1,4 @@
-use crate::client::client::Transport;
+use crate::client::client_builder::Transport;
 use crate::client::error::Error;
 use crate::client::types::DataReference;
 use crate::types::{
