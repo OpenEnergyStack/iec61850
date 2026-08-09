@@ -18,6 +18,7 @@ pub(crate) trait Transport: Send + Sync {
     async fn get_server_directory(&self) -> Result<Vec<String>, Error>;
     async fn get_logical_device_directory(&self, ld_name: String) -> Result<Vec<String>, Error>;
     async fn get_data_definition(&self, data_ref: DataReference) -> Result<DataDefinition, Error>;
+    async fn get_data_set_directory(&self, data_set_ref: String) -> Result<Vec<String>, Error>;
     async fn set_brcb_values(
         &self,
         brcb_ref: String,
@@ -125,6 +126,10 @@ impl Client {
         data_ref: DataReference,
     ) -> Result<DataDefinition, Error> {
         self.transport.get_data_definition(data_ref).await
+    }
+
+    pub async fn get_data_set_directory(&self, data_set_ref: String) -> Result<Vec<String>, Error> {
+        self.transport.get_data_set_directory(data_set_ref).await
     }
 
     pub async fn set_brcb_values(
@@ -237,6 +242,14 @@ mod tests {
                 .unwrap()
                 .push(format!("def:{}", data_ref.reference));
             todo!("Return proper DataDefinition")
+        }
+
+        async fn get_data_set_directory(&self, data_set_ref: String) -> Result<Vec<String>, Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ds:{}", data_set_ref));
+            Ok(vec![])
         }
 
         async fn set_brcb_values(
