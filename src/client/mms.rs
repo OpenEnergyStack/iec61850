@@ -487,11 +487,15 @@ fn parse_references(
 }
 
 fn parse_paths(data_reference: &DataReference) -> Result<(String, Vec<&str>), Error> {
-    let parts: Vec<&str> = data_reference.reference.split('/').collect();
+    parse_reference(&data_reference.reference)
+}
+
+fn parse_reference(reference: &str) -> Result<(String, Vec<&str>), Error> {
+    let parts: Vec<&str> = reference.split('/').collect();
     if parts.len() != 2 {
         return Err(Error::ParseError(format!(
             "Invalid reference format. Expected 'Domain/Path[FC]', found: {}",
-            data_reference.reference
+            reference
         )));
     }
 
@@ -499,6 +503,94 @@ fn parse_paths(data_reference: &DataReference) -> Result<(String, Vec<&str>), Er
     let data_path = parts[1].split('.').collect::<Vec<&str>>();
 
     Ok((domain_id, data_path))
+}
+
+/// Builds an MMS `ObjectName` for a DataSet reference.
+///
+/// IEC 61850 DataSet references have the form `IEDLD/LN.DataSetName`.
+/// The logical device (`IEDLD`) becomes the MMS domain-id. The logical node
+/// and data set name are encoded as `LN$DataSetName` in the MMS itemId.
+///
+/// When the reference contains only a logical device (e.g. `IEDLD`), the
+/// object name is `vmd-specific` so that `GetDataSetDirectory` returns all
+/// DataSets for that LD.
+fn build_data_set_object_name(data_set_ref: &str) -> Result<ObjectName, Error> {
+    // LD-only references such as `IEDLD` are sent as vmd-specific object names.
+    if !data_set_ref.contains('/') {
+        return Ok(ObjectName::vmd_specific(Identifier(
+            VisibleString::try_from(data_set_ref.to_string()).unwrap_or_default(),
+        )));
+    }
+
+    let (domain_id, data_path) = parse_reference(data_set_ref)?;
+
+    if data_path.len() == 1 {
+        // Reference stops at the LN (e.g. `IEDLD/LLN0`).
+        return Ok(ObjectName::domain_specific(ObjectNameDomainSpecific {
+            domain_id: Identifier(VisibleString::try_from(domain_id).unwrap_or_default()),
+            item_id: Identifier(
+                VisibleString::try_from(data_path[0].to_string()).unwrap_or_default(),
+            ),
+        }));
+    }
+
+    let item_id = data_path.join("$");
+    Ok(ObjectName::domain_specific(ObjectNameDomainSpecific {
+        domain_id: Identifier(VisibleString::try_from(domain_id).unwrap_or_default()),
+        item_id: Identifier(VisibleString::try_from(item_id).unwrap_or_default()),
+    }))
+}
+
+/// Converts an MMS `VariableAccessSpecification` returned by
+/// `GetNamedVariableListAttributes` into an IEC 61850 DataSet member reference
+/// of the form `IEDLD/LN.DataSetName`.
+fn variable_access_specification_to_data_set_ref(
+    spec: &VariableSpecification,
+) -> Result<String, Error> {
+    let VariableSpecification::name(name) = spec else {
+        return Err(Error::ParseError(
+            "unsupported variable specification for data set member".to_string(),
+        ));
+    };
+
+    match name {
+        ObjectName::domain_specific(ds) => {
+            let item_id = ds.item_id.0.to_string();
+            let parts: Vec<&str> = item_id.split('$').collect();
+            if parts.len() < 2 {
+                return Err(Error::ParseError(format!(
+                    "invalid domain-specific data set item id: {}",
+                    item_id
+                )));
+            }
+            let ln = parts[0];
+            let data_set_name = parts[1];
+            Ok(format!("{}/{ln}.{data_set_name}", ds.domain_id.0))
+        }
+        ObjectName::vmd_specific(id) => {
+            let item_id = id.0.to_string();
+            let parts: Vec<&str> = item_id.split('$').collect();
+            if parts.len() < 2 {
+                return Err(Error::ParseError(format!(
+                    "invalid vmd-specific data set item id: {}",
+                    item_id
+                )));
+            }
+            let ld = parts[0];
+            let ln = parts[1];
+            let data_set_name = parts.get(2).unwrap_or(&"");
+            if data_set_name.is_empty() {
+                return Err(Error::ParseError(format!(
+                    "invalid vmd-specific data set item id: {}",
+                    item_id
+                )));
+            }
+            Ok(format!("{ld}/{ln}.{data_set_name}"))
+        }
+        ObjectName::aa_specific(_) => Err(Error::ParseError(
+            "aa-specific object names are not supported for data sets".to_string(),
+        )),
+    }
 }
 
 // return itemId for a given reference, e.g., "IED1/LLN0$ST$Val" -> "LLN0$ST$Val"
@@ -515,6 +607,19 @@ fn build_item_id(fc: &str, item_id_path: Vec<&str>) -> String {
         item_id.push_str(part);
     }
 
+    item_id
+}
+
+/// Builds an itemId for `GetVariableAccessAttributes` where no MMS alternate
+/// access is available. Array indices are kept in the path, e.g.
+/// `LLN0$ST$Hrs$hr(1)`.
+fn build_item_id_for_definition(fc: &str, item_id_path: Vec<&str>) -> String {
+    let logical_node = item_id_path[0];
+    let mut item_id = format!("{}${}", logical_node, fc);
+    for part in &item_id_path[1..] {
+        item_id.push('$');
+        item_id.push_str(part);
+    }
     item_id
 }
 
@@ -891,14 +996,23 @@ async fn subscribe_last_appl_error(
 /// Returns `true` when `spec` identifies a `LastApplError` information report.
 fn is_last_app_error_report(spec: &VariableAccessSpecification) -> bool {
     fn is_last_appl_error_name(name: &ObjectName) -> bool {
-        matches!(name, ObjectName::vmd_specific(id) if id.0.to_string() == "LastApplError")
+        match name {
+            ObjectName::vmd_specific(id) => id.0.to_string() == "LastApplError",
+            _ => false,
+        }
     }
+
     match spec {
         VariableAccessSpecification::variableListName(name) => is_last_appl_error_name(name),
         VariableAccessSpecification::listOfVariable(list) => {
-            list.0.len() == 1
-                && matches!(&list.0[0].variable_specification,
-                    VariableSpecification::name(n) if is_last_appl_error_name(n))
+            if list.0.len() == 1 {
+                match &list.0[0].variable_specification {
+                    VariableSpecification::name(n) => is_last_appl_error_name(n),
+                    _ => false,
+                }
+            } else {
+                false
+            }
         }
     }
 }
@@ -1053,7 +1167,8 @@ impl Transport for MmsTransport {
         let domain_object = ObjectNameDomainSpecific {
             domain_id: Identifier(VisibleString::try_from(domain_id).unwrap_or_default()),
             item_id: Identifier(
-                VisibleString::try_from(build_item_id(fc, data_path.clone())).unwrap_or_default(),
+                VisibleString::try_from(build_item_id_for_definition(fc, data_path.clone()))
+                    .unwrap_or_default(),
             ),
         };
         let object_name = ObjectName::domain_specific(domain_object);
@@ -1070,6 +1185,25 @@ impl Transport for MmsTransport {
             name,
             &result.type_description,
         ))
+    }
+
+    async fn get_data_set_directory(&self, data_set_ref: String) -> Result<Vec<String>, Error> {
+        let object_name = build_data_set_object_name(&data_set_ref)?;
+
+        let response = self
+            .client
+            .get_named_variable_list_attributes(object_name)
+            .await
+            .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
+
+        response
+            .list_of_variable
+            .0
+            .into_iter()
+            .map(|entry| {
+                variable_access_specification_to_data_set_ref(&entry.variable_specification)
+            })
+            .collect()
     }
 
     async fn set_brcb_values(
@@ -2118,22 +2252,20 @@ mod tests {
     use rasn::types::{OctetString, SequenceOf};
 
     fn unwrap_item_id(spec: &VariableAccessSpecification) -> String {
-        match spec {
-            VariableAccessSpecification::listOfVariable(list) => {
-                let first = list.0.get(0).expect("expected at least one variable");
-
-                match &first.variable_specification {
-                    VariableSpecification::name(object_name) => {
-                        if let ObjectName::domain_specific(ds) = object_name {
-                            return ds.item_id.0.to_string();
-                        }
-                        panic!("unexpected object name variant");
-                    }
-                    _ => panic!("unexpected variable specification variant"),
-                }
-            }
+        let list = match spec {
+            VariableAccessSpecification::listOfVariable(list) => list,
             _ => panic!("unexpected variable access spec variant"),
-        }
+        };
+        let first = list.0.get(0).expect("expected at least one variable");
+        let object_name = match &first.variable_specification {
+            VariableSpecification::name(object_name) => object_name,
+            _ => panic!("unexpected variable specification variant"),
+        };
+        let ds = match object_name {
+            ObjectName::domain_specific(ds) => ds,
+            _ => panic!("unexpected object name variant"),
+        };
+        ds.item_id.0.to_string()
     }
 
     #[test]
@@ -2337,5 +2469,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn build_item_id_for_definition_keeps_full_path() {
+        let path = vec!["LLN0", "Mod", "stVal"];
+        assert_eq!(
+            build_item_id_for_definition("ST", path),
+            "LLN0$ST$Mod$stVal"
+        );
+    }
+
+    #[test]
+    fn build_item_id_for_definition_keeps_array_index() {
+        let path = vec!["LLN0", "Hrs", "hr(3)"];
+        assert_eq!(
+            build_item_id_for_definition("ST", path),
+            "LLN0$ST$Hrs$hr(3)"
+        );
+    }
+
+    #[test]
+    fn build_data_set_object_name_uses_vmd_specific_for_ld_only() {
+        let name = build_data_set_object_name("IED1LD0").expect("valid ld reference");
+        assert!(matches!(name, ObjectName::vmd_specific(id) if id.0.to_string() == "IED1LD0"));
+    }
+
+    #[test]
+    fn build_data_set_object_name_uses_domain_specific_for_ln() {
+        let name = build_data_set_object_name("IED1LD0/LLN0").expect("valid ln reference");
+        match name {
+            ObjectName::domain_specific(ds) => {
+                assert_eq!(ds.domain_id.0.to_string(), "IED1LD0");
+                assert_eq!(ds.item_id.0.to_string(), "LLN0");
+            }
+            other => panic!("expected domain-specific object name, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_data_set_object_name_uses_domain_specific_for_full_data_set() {
+        let name =
+            build_data_set_object_name("IED1LD0/LLN0.dataSet1").expect("valid data set reference");
+        match name {
+            ObjectName::domain_specific(ds) => {
+                assert_eq!(ds.domain_id.0.to_string(), "IED1LD0");
+                assert_eq!(ds.item_id.0.to_string(), "LLN0$dataSet1");
+            }
+            other => panic!("expected domain-specific object name, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_set_ref_from_domain_specific_variable_specification() {
+        let spec =
+            VariableSpecification::name(ObjectName::domain_specific(ObjectNameDomainSpecific {
+                domain_id: Identifier(VisibleString::try_from("IED1LD0").unwrap()),
+                item_id: Identifier(VisibleString::try_from("LLN0$dataSet1").unwrap()),
+            }));
+
+        assert_eq!(
+            variable_access_specification_to_data_set_ref(&spec).expect("valid spec"),
+            "IED1LD0/LLN0.dataSet1"
+        );
+    }
+
+    #[test]
+    fn data_set_ref_from_vmd_specific_variable_specification() {
+        let spec = VariableSpecification::name(ObjectName::vmd_specific(Identifier(
+            VisibleString::try_from("IED1LD0$LLN0$dataSet1").unwrap(),
+        )));
+
+        assert_eq!(
+            variable_access_specification_to_data_set_ref(&spec).expect("valid spec"),
+            "IED1LD0/LLN0.dataSet1"
+        );
     }
 }

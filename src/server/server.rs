@@ -93,10 +93,18 @@ impl Server {
         }
     }
 
-    /// Start the server with a JSON model string.
+    /// Start the server from a JSON model string.
     pub async fn run(self, model_json: String) -> Result<(), std::io::Error> {
         let model = ServerModel::from_json(&model_json)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        self.run_with_model(model).await
+    }
+
+    /// Start the server with a pre-built model.
+    ///
+    /// This allows callers to initialize leaf values via [`ServerModel::value_store`]
+    /// before serving clients.
+    pub async fn run_with_model(self, model: ServerModel) -> Result<(), std::io::Error> {
         match self.inner {
             Inner::Mms(s) => s.run(model).await,
         }
